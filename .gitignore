@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.so
+.Python
+.pytest_cache/
+.mypy_cache/
+
+.DS_Store
+
+runs/
+*.onnx
+*.pth
+
+instance_bank_semantickitti.npz
+.codex

@@ -1,0 +1,239 @@
+# PRFNet 训练配置文件 — RTX 5090 (32GB) + 14 vCPU
+# 所有超参数均在此集中管理，train.py 不含硬编码数值
+
+# ─────────────────────────────────────────────────────────────
+# 数据集
+# ─────────────────────────────────────────────────────────────
+data:
+  root: /root/autodl-tmp/semantickitti/dataset/
+  num_classes: 19
+  ignore_index: 255
+
+  # Range Image 分辨率（全分辨率）
+  rv_H: 64
+  rv_W: 1024
+
+  # Polar BEV 分辨率（W 与 rv_W 相同，保持方位角轴对齐）
+  pb_H: 640
+  pb_W: 1024
+
+  # 每帧最大点数（5090 32GB 无需截断）
+  max_points: 131072
+
+  # 传感器参数（HDL-64E）
+  fov_up:   2.0     # 度
+  fov_down: -24.8   # 度
+  R_max: 85.0       # 最大探测距离(m)
+
+  # DataLoader — 25 vCPU，留 3-4 给主进程 + OS + GPU 驱动
+  # copy-paste 后单帧 worker 耗时 ~55ms，GPU 步约 150ms，11× 富余，不成为瓶颈
+  batch_size: 2
+  num_workers: 20
+
+  # 验证 DataLoader
+  val_batch_size: 4
+  val_num_workers: 24
+
+  # 增强
+  augment: true
+  use_polarmix: true
+  rotate: true
+  flip: true
+  scale_min: 0.95
+  scale_max: 1.05
+  drop_p: 0.05
+  polarmix_p: 0.5        # PolarMix 触发概率
+  polarmix_sectors: 8    # 方位角扇区数
+  use_lasermix: true
+  lasermix_p: 0.5        # LaserMix 触发概率
+
+  # ── Copy-Paste 实例增强 ────────────────────────────────────
+  # 需先运行 tools/build_instance_bank.py 生成 bank 文件，再将 enable 改为 true
+  # 对 motorcyclist(7)/bicyclist(6)/person(5) 等稀有类效果显著
+  copy_paste:
+    enable: true
+    bank_path: "instance_bank_semantickitti.npz"   # 相对于工作目录
+    # 每类配置：prob = 每帧触发粘贴的概率，k = 最多尝试粘贴的实例数
+    classes:
+      7: {prob: 0.90, k: 3}   # motorcyclist：最稀有，全力增强
+      6: {prob: 0.70, k: 3}   # bicyclist：提高概率增强泛化
+      5: {prob: 0.60, k: 2}   # person
+      2: {prob: 0.50, k: 2}   # motorcycle（静止）：bank 中 2835 实例
+      1: {prob: 0.40, k: 2}   # bicycle（静止）：bank 中 4220 实例，略降概率避免过拟合
+    drop_p_base: 0.05    # DropPoints 基础比例；随实例距离自适应放大（最多 15%）
+    min_keep_pts: 15     # 每实例 DropPoints 后最少保留点数
+    max_tries: 50        # BEV 位置搜索最大重试次数（超出则跳过本次粘贴）
+
+# ─────────────────────────────────────────────────────────────
+# 模型（全容量，5090 可承载）
+# ─────────────────────────────────────────────────────────────
+model:
+  pb_in: 9             # Polar BEV  输入通道（固定）
+  enc_channels: [96, 192, 384, 384]   # 编码器各阶段通道数 # 原本64 128 256 256
+  dec_out_c: 64        # 解码器输出通道
+  head_dropout: 0.10   # 逐点分类头 dropout；建议 0.05~0.20
+
+  # 编码器各阶段 InvertedResidual expand 比例
+  # 早期大空间分辨率用 2（平衡容量与显存），后期小分辨率用 4  # 原本[2,2,4,4]
+  expand_ratios: [2, 4, 6, 6]
+
+  # 编码器各阶段步长 [H_stride, W_stride]
+  rv_strides: [[1,2],[2,2],[2,2],[2,2]]
+  pb_strides: [[2,2],[2,2],[2,2],[2,2]]
+
+  # ASPP 空洞率
+  aspp_rates: [1, 3, 6, 9]
+
+  # 【创新点】深度分层方位角对齐融合（DS-AAFF）
+  # true：启用 DS-AAFF（将 H 维度分 K 个距离带分别对齐融合）
+  # false：退回原始全局 AAFF（消融对比用）
+  use_ds_aaff: true
+  ds_aaff_K: 4            # 距离分带数（4=近/中近/中远/远，可调 2~8）
+
+  # ── 【创新点①】表面法向量特征 ─────────────────────────────────
+  # 从 Range Image 的 3D 坐标中心差分叉乘估计局部表面法向量 (nx, ny, nz)，
+  # 追加为 +3 通道（等价于球面投影雅可比 ∂p/∂θ × ∂p/∂φ 的离散近似）。
+  # 仅对 4 邻域均有效的像素填充，其余置 0（避免空像素污染切向量方向）。
+  # 几何意义：道路/地面→朝上(0,0,1)；建筑墙面→水平固定；
+  #           植被→各向随机；路灯/电线杆→沿圆周变化；小目标边界→法向量突变
+  # 预期收益：mIoU +1.5~2.5%（person/pole/traffic-sign 改善最显著）
+  # RKNN 兼容：纯 numpy 预计算，无额外模型算子
+  # 消融对比：改为 false 可单独评估本创新点贡献
+  use_surface_normals: true
+
+  # ── 【创新点②】仰角+方位角位置编码 ──────────────────────────────
+  # 追加 3 个角度通道（sin_phi, cos_theta, sin_theta），对所有像素（含空像素）
+  # 按网格坐标填充，形成完整几何坐标系。
+  # 同时将原有 cos_phi（ch[5]）也改为全像素网格填充，修正其在空像素处
+  # 错误显示 0 的问题（cos(-10°)≈0.98 而非 0）。
+  # 几何意义：给网络显式几何标尺，解决同距离不同仰角的形状压缩差异
+  # 预期收益：mIoU +0.5~1.0%
+  # 消融对比：改为 false 可单独评估本创新点贡献
+  use_angle_encoding: true
+
+  # ── 【创新点④】视图置信度门控（VCG）────────────────────────────
+  # per-channel gate = 1 + tanh(Linear(rv||pb)) ∈ [0,2]
+  # 零初始化 → 训练起点与原始行为等价，RKNN 兼容（Gemm+Tanh+Mul）
+  # 消融对比：改为 false 可单独评估本创新点贡献
+  use_vcg: false
+
+  # ── 【创新点⑤】语义原型记忆（SPM）──────────────────────────────
+  # 维护 19 类 EMA 原型，余弦相似度叠加到主 logits，
+  # 为 motorcyclist 等稀有类提供跨 batch 稳定类别参考
+  # ONNX 导出时原型冻结为静态常量，RKNN 完全兼容
+  # 消融对比：改为 false 可单独评估本创新点贡献
+  use_proto: false
+  proto_dim: 64        # 原型向量维度（19 类线性可分，64-dim 足够）
+
+  # rv_in 由 train.py 根据上述开关自动计算，此处仅作参考，勿手动维护：
+  #   6（均关）| 9（任一开）| 12（均开）
+  #  如需手动覆盖（如迁移旧 checkpoint），请同步关闭上方开关
+  rv_in: 12
+
+# ─────────────────────────────────────────────────────────────
+# 训练
+# ─────────────────────────────────────────────────────────────
+train:
+  epochs: 50
+  seed: 42
+
+  # 优化器 (AdamW)
+  optimizer: adamw
+  # 热启动用 6e-4（原始训练 2e-3 的 1/3）
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  grad_clip: 10.0
+
+  # 学习率调度
+  # onecycle：从零训练用，LR 先升后降（有破坏性峰值，不适合热启动）
+  # cosine：热启动用，从 lr 单调下降到 eta_min，平滑无峰值
+  scheduler: onecycle
+  pct_start: 0.10      # warmup 占总步数比例（仅 onecycle 生效）
+  eta_min: 1.0e-6      # CosineAnnealingLR 最小 LR（仅 cosine 生效）
+
+  # 混合精度（5090 Tensor Core 效益显著）
+  amp: true
+
+  # EMA 影子模型衰减系数（验证/保存均使用 EMA 权重）
+  ema_decay: 0.999
+
+  # 验证频率（每 N 个 epoch）
+  val_every: 1
+  save_topk_ckpts: 5   # 每次验证后保留 top-k（按 val mIoU）供集成推理
+
+# ─────────────────────────────────────────────────────────────
+# 损失函数
+# ─────────────────────────────────────────────────────────────
+loss:
+  lambda_lovasz: 1.5   # Lovász-Softmax 损失权重
+  lambda_aux: 0.1      # 辅助损失权重
+
+  # ── Focal Loss 开关 ──────────────────────────────────────
+  # use_focal: true  → 使用 FocalLoss，自动聚焦难分样本（motorcyclist 等稀有类受益）
+  # use_focal: false → 使用标准 CrossEntropyLoss + label_smoothing
+  # 两者互斥：use_focal=true 时 label_smoothing 被忽略
+  use_focal: true
+  focal_gamma: 2.0     # Focal Loss 聚焦系数 γ；γ 越大对难样本惩罚越重（推荐 1.5~3.0）
+                       # 仅 use_focal=true 时生效
+
+  # 标签平滑（缓解 SemanticKITTI 标注噪声）
+  # 仅 use_focal=false 时生效；use_focal=true 时请保持 0.0
+  # 注意：label_smoothing 会均匀软化所有类的目标概率，
+  #       对稀有类（motorcyclist 等）会削弱本已微弱的梯度信号，
+  #       若切换为 Focal Loss 应将此项设为 0.0  原本为0.1
+  label_smoothing: 0.0
+
+  # 类别权重（19类，按频率倒数手动校准）
+  class_weights:
+    - 1.00   # car
+    - 5.20   # bicycle
+    - 5.20   # motorcycle
+    - 5.00   # truck
+    - 4.50   # other-vehicle
+    - 8.10   # person
+    - 7.00   # bicyclist
+    - 14.0   # motorcyclist
+    - 1.00   # road
+    - 3.20   # parking
+    - 1.50   # sidewalk
+    - 6.00   # other-ground
+    - 1.20   # building
+    - 3.00   # fence
+    - 1.00   # vegetation
+    - 4.00   # trunk
+    - 1.50   # terrain
+    - 6.00   # pole
+    - 8.00   # traffic-sign
+
+# ─────────────────────────────────────────────────────────────
+# 推理 / 评估
+# ─────────────────────────────────────────────────────────────
+eval:
+  # ── KNN 后处理开关 ───────────────────────────────────────
+  # use_knn: true  → 推理后做 2D 邻域投票，修正边界误分类（约 +1~2% mIoU）
+  # use_knn: false → 直接使用模型原始输出
+  #
+  # 实现：RV 2D 窗口投票（纯 numpy，无额外依赖）
+  #   旧方案 3D cKDTree：~13 分钟/次（每帧 ~0.2s）
+  #   当前方案 RV 2D：  < 20 秒/次  （每帧 ~0.003s）
+  # 训练期间也可开启，几乎不影响验证速度。
+  use_knn: false
+  knn_radius: 1    # 投票窗口半径；1 = 3×3（9 邻居），2 = 5×5（25 邻居）
+                   # radius=1 已足够，更大值收益递减且可能过平滑
+
+  # ── 双视图融合开关 ────────────────────────────────────────
+  # knn_dual: true  → RV + PB 双视图投票（需 use_knn=true 才生效）
+  #                   RV 负责俯仰/beam 方向，PB 负责径向/距离方向
+  #                   两者方位角轴对齐，等权合并投票覆盖更完整的 3D 邻域
+  #                   额外耗时约 ×2，总计仍 < 30s/次
+  # knn_dual: false → 仅 RV 单视图（默认，足以覆盖大部分边界噪声）
+  knn_dual: false
+
+# ─────────────────────────────────────────────────────────────
+# 日志与存储
+# ─────────────────────────────────────────────────────────────
+log:
+  save_dir: runs/prfnet_semantickitti  # 实验根目录（含 ckpt + log）
+  log_interval: 50        # TensorBoard 步级写入间隔（步级文本日志受 log_steps 控制）
+  log_steps: false         # false = 不写步级文本日志，仅写 TensorBoard；true = 同时写文本
+  tb_flush_secs: 30       # TensorBoard flush 间隔(秒)
