@@ -1189,8 +1189,7 @@ def infer_single_bin(bin_path: str, cfg_path: str, ckpt_path: str,
         R_max=dc['R_max']
     )
     pb_proj = PolarBEVProjector(
-        H=dc['pb_H'], W=dc['pb_W'],
-        R_max=dc['R_max'], z_min=dc['z_min'], z_max=dc['z_max']
+        H_p=dc['pb_H'], W_p=dc['pb_W'], R_max=dc['R_max']
     )
 
     rv_img, rv_mask = rv_proj.project(pts[:, :3], pts[:, 3])

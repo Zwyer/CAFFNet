@@ -65,16 +65,25 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--cfg",
-        default="prfnet/configs/pretrain_nomae_pcp_semantickitti.yaml",
+        default="prfnet/configs/prfnet_semantickitti_unified.yaml",
         help="pretraining config path",
     )
     ap.add_argument("--dry-run", action="store_true", help="run one step and exit")
     args = ap.parse_args()
 
     cfg = load_cfg(args.cfg)
-    dc = cfg["data"]
+    dc = dict(cfg["data"])
+    mc = dict(cfg["model"])
     pc = cfg["pretrain"]
-    lg = cfg["log"]
+    lg = cfg.get("pretrain_log", cfg.get("log", {"save_dir": "runs/prfnet_pretrain_nomae_pcp"}))
+
+    # Optional overrides for pretraining-only experiment knobs.
+    if "pretrain_data" in cfg:
+        dc.update(cfg["pretrain_data"])
+    if "pretrain_model" in cfg:
+        mc.update(cfg["pretrain_model"])
+
+    cfg_for_model = {"data": dc, "model": mc}
 
     seed = int(pc.get("seed", 42))
     torch.manual_seed(seed)
@@ -136,7 +145,7 @@ def main() -> None:
             raise
         print(f"[warn] dataset unavailable for dry-run, fallback to synthetic: {e}", flush=True)
 
-    model = build_model(cfg, device)
+    model = build_model(cfg_for_model, device)
     criterion = NOMAEPCPLoss(
         lambda_occ=pc.get("lambda_occ", 1.0), lambda_pcp=pc.get("lambda_pcp", 0.5)
     )
@@ -146,10 +155,20 @@ def main() -> None:
         weight_decay=pc.get("weight_decay", 1e-4),
     )
     total_steps = (len(loader) if loader is not None else 1) * int(pc.get("epochs", 10))
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(total_steps, 1), eta_min=pc.get("eta_min", 1e-6)
-    )
-    scaler = torch.amp.GradScaler("cuda", enabled=pc.get("amp", True))
+    sched_type = str(pc.get("scheduler", "cosine")).lower()
+    if sched_type == "onecycle":
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=float(pc.get("lr", 8e-4)),
+            total_steps=max(total_steps, 1),
+            pct_start=float(pc.get("pct_start", 0.1)),
+        )
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(total_steps, 1), eta_min=pc.get("eta_min", 1e-6)
+        )
+    amp_enabled_global = bool(pc.get("amp", True)) and device.type == "cuda"
+    scaler = torch.amp.GradScaler(device.type, enabled=amp_enabled_global)
 
     rv_mask_ratio = float(pc.get("rv_mask_ratio", 0.7))
     pb_mask_ratio = float(pc.get("pb_mask_ratio", 0.7))
@@ -182,8 +201,7 @@ def main() -> None:
             pb_img = batch["pb_img"].to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
-            amp_enabled = bool(pc.get("amp", True)) and device.type == "cuda"
-            with torch.amp.autocast(device_type=device.type, enabled=amp_enabled):
+            with torch.amp.autocast(device_type=device.type, enabled=amp_enabled_global):
                 outputs = model.forward_pretrain(
                     rv_img=rv_img,
                     pb_img=pb_img,

@@ -1,0 +1,148 @@
+# PRFNet 统一配置：监督训练 + NOMAE/PCP 预训练
+# train.py 使用 data/model/train/loss/eval/log
+# tools/pretrain_nomae_pcp.py 使用 data/model + pretrain + pretrain_data/pretrain_model + pretrain_log
+
+data:
+  root: /root/autodl-tmp/semantickitti/dataset/
+  num_classes: 19
+  ignore_index: 255
+  rv_H: 64
+  rv_W: 1024
+  pb_H: 640
+  pb_W: 1024
+  max_points: 131072
+  fov_up: 2.0
+  fov_down: -24.8
+  R_max: 85.0
+  batch_size: 2
+  num_workers: 20
+  val_batch_size: 4
+  val_num_workers: 24
+  augment: true
+  use_polarmix: true
+  rotate: true
+  flip: true
+  scale_min: 0.95
+  scale_max: 1.05
+  drop_p: 0.05
+  polarmix_p: 0.5
+  polarmix_sectors: 8
+  use_lasermix: true
+  lasermix_p: 0.5
+  copy_paste:
+    enable: true
+    bank_path: "instance_bank_semantickitti.npz"
+    classes:
+      7: {prob: 0.90, k: 3}
+      6: {prob: 0.70, k: 3}
+      5: {prob: 0.60, k: 2}
+      2: {prob: 0.50, k: 2}
+      1: {prob: 0.40, k: 2}
+    drop_p_base: 0.05
+    min_keep_pts: 15
+    max_tries: 50
+
+model:
+  pb_in: 9
+  enc_channels: [96, 192, 384, 384]
+  dec_out_c: 64
+  head_dropout: 0.10
+  expand_ratios: [2, 4, 6, 6]
+  rv_strides: [[1,2],[2,2],[2,2],[2,2]]
+  pb_strides: [[2,2],[2,2],[2,2],[2,2]]
+  aspp_rates: [1, 3, 6, 9]
+  use_ds_aaff: true
+  ds_aaff_K: 4
+  use_surface_normals: true
+  use_angle_encoding: true
+  use_vcg: false
+  use_proto: false
+  proto_dim: 64
+  rv_in: 12
+
+train:
+  epochs: 50
+  seed: 42
+  optimizer: adamw
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  grad_clip: 10.0
+  scheduler: onecycle
+  pct_start: 0.10
+  eta_min: 1.0e-6
+  amp: true
+  ema_decay: 0.999
+  val_every: 1
+  save_topk_ckpts: 5
+
+loss:
+  lambda_lovasz: 1.5
+  lambda_aux: 0.1
+  use_focal: true
+  focal_gamma: 2.0
+  label_smoothing: 0.0
+  class_weights:
+    - 1.00
+    - 5.20
+    - 5.20
+    - 5.00
+    - 4.50
+    - 8.10
+    - 7.00
+    - 14.0
+    - 1.00
+    - 3.20
+    - 1.50
+    - 6.00
+    - 1.20
+    - 3.00
+    - 1.00
+    - 4.00
+    - 1.50
+    - 6.00
+    - 8.00
+
+eval:
+  use_knn: false
+  knn_radius: 1
+  knn_dual: false
+
+log:
+  save_dir: runs/prfnet_semantickitti
+  log_interval: 50
+  log_steps: false
+  tb_flush_secs: 30
+
+# ---------------- Pretrain (NOMAE + PCP) ----------------
+pretrain:
+  epochs: 10
+  seed: 42
+  lr: 8.0e-4
+  weight_decay: 1.0e-4
+  grad_clip: 10.0
+  amp: true
+  scheduler: cosine        # cosine | onecycle
+  pct_start: 0.10          # onecycle 用
+  eta_min: 1.0e-6
+  rv_mask_ratio: 0.70
+  pb_mask_ratio: 0.70
+  lambda_occ: 1.0
+  lambda_pcp: 0.5
+  log_interval: 20
+
+# Pretraining-specific data/model overrides (optional)
+pretrain_data:
+  batch_size: 2
+  num_workers: 12
+  augment: true
+  use_polarmix: false
+  use_lasermix: false
+  polarmix_p: 0.0
+  lasermix_p: 0.0
+
+pretrain_model:
+  use_vcg: false
+  use_proto: false
+
+pretrain_log:
+  save_dir: runs/prfnet_pretrain_nomae_pcp
