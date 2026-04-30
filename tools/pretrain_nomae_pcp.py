@@ -181,6 +181,11 @@ def main() -> None:
     for epoch in range(1, epochs + 1):
         t0 = time.time()
         ep_total = ep_occ = ep_pcp = 0.0
+        ep_step_time = 0.0
+        ep_grad_norm = 0.0
+        ep_rv_occ = ep_pb_occ = 0.0
+        ep_mask_rv = ep_mask_pb = 0.0
+        _iter_t_prev = time.time()
         if loader is None:
             rv_in = 6 + 3 * int(dc.get("use_surface_normals", False)) + 3 * int(
                 dc.get("use_angle_encoding", False)
@@ -197,8 +202,12 @@ def main() -> None:
 
         for step, batch in iters:
             global_step += 1
+            _iter_t_now = time.time()
+            data_dt = _iter_t_now - _iter_t_prev
             rv_img = batch["rv_img"].to(device, non_blocking=True)
             pb_img = batch["pb_img"].to(device, non_blocking=True)
+            labels_cpu = batch.get("labels", None)
+            _step_t0 = time.time()
 
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type, enabled=amp_enabled_global):
@@ -213,7 +222,7 @@ def main() -> None:
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
@@ -221,22 +230,52 @@ def main() -> None:
             ep_total += float(loss.item())
             ep_occ += float(loss_dict["occ"].item())
             ep_pcp += float(loss_dict["pcp"].item())
+            ep_step_time += (time.time() - _step_t0)
+            ep_grad_norm += float(grad_norm.detach().cpu().item()
+                                  if torch.is_tensor(grad_norm) else grad_norm)
+            ep_rv_occ += float((rv_img[:, 3:4] > 0).float().mean().item())
+            ep_pb_occ += float(pb_img[:, 8:9].float().mean().item())
+            ep_mask_rv += float(outputs["rv_mask_ratio"].item())
+            ep_mask_pb += float(outputs["pb_mask_ratio"].item())
 
             if step % log_interval == 0:
                 lr = optimizer.param_groups[0]["lr"]
                 print(
                     f"[pretrain] ep={epoch:03d}/{epochs} step={step:04d}/{(len(loader) if loader is not None else 1)} "
                     f"loss={ep_total/step:.4f} occ={loss_dict['occ']:.4f} "
-                    f"pcp={loss_dict['pcp']:.4f} lr={lr:.2e}",
+                    f"pcp={loss_dict['pcp']:.4f} lr={lr:.2e} "
+                    f"gnorm={float(grad_norm):.2f}",
                     flush=True,
                 )
                 writer.add_scalar("pretrain/loss_step", ep_total / step, global_step)
                 writer.add_scalar("pretrain/occ_step", loss_dict["occ"], global_step)
                 writer.add_scalar("pretrain/pcp_step", loss_dict["pcp"], global_step)
                 writer.add_scalar("pretrain/lr", lr, global_step)
+                writer.add_scalar("pretrain/rv_mask_ratio_step", outputs["rv_mask_ratio"], global_step)
+                writer.add_scalar("pretrain/pb_mask_ratio_step", outputs["pb_mask_ratio"], global_step)
+                writer.add_scalar("diag/grad_norm_step", float(grad_norm), global_step)
+                writer.add_scalar("diag/data_time_s_step", data_dt, global_step)
+                writer.add_scalar("diag/step_time_s_step", time.time() - _step_t0, global_step)
+                writer.add_scalar("diag/rv_occ_step", float((rv_img[:, 3:4] > 0).float().mean().item()), global_step)
+                writer.add_scalar("diag/pb_occ_step", float(pb_img[:, 8:9].float().mean().item()), global_step)
+                if labels_cpu is not None:
+                    valid = labels_cpu != 255
+                    writer.add_scalar(
+                        "diag/points_valid_ratio_step",
+                        float(valid.sum().item()) / max(float(labels_cpu.numel()), 1.0),
+                        global_step,
+                    )
+                if device.type == "cuda":
+                    writer.add_scalar("diag/gpu_mem_alloc_mb_step",
+                                      torch.cuda.memory_allocated(device) / 1024.0 / 1024.0,
+                                      global_step)
+                    writer.add_scalar("diag/gpu_mem_reserved_mb_step",
+                                      torch.cuda.memory_reserved(device) / 1024.0 / 1024.0,
+                                      global_step)
 
             if args.dry_run:
                 break
+            _iter_t_prev = time.time()
 
         n = max(step, 1)
         dt = time.time() - t0
@@ -248,6 +287,20 @@ def main() -> None:
         writer.add_scalar("pretrain/loss_epoch", ep_total / n, epoch)
         writer.add_scalar("pretrain/occ_epoch", ep_occ / n, epoch)
         writer.add_scalar("pretrain/pcp_epoch", ep_pcp / n, epoch)
+        writer.add_scalar("pretrain/rv_mask_ratio_epoch", ep_mask_rv / n, epoch)
+        writer.add_scalar("pretrain/pb_mask_ratio_epoch", ep_mask_pb / n, epoch)
+        writer.add_scalar("diag/grad_norm_epoch", ep_grad_norm / n, epoch)
+        writer.add_scalar("diag/rv_occ_epoch", ep_rv_occ / n, epoch)
+        writer.add_scalar("diag/pb_occ_epoch", ep_pb_occ / n, epoch)
+        writer.add_scalar("diag/step_time_s_epoch", ep_step_time / n, epoch)
+        if device.type == "cuda":
+            writer.add_scalar("diag/gpu_mem_alloc_mb_epoch",
+                              torch.cuda.max_memory_allocated(device) / 1024.0 / 1024.0,
+                              epoch)
+            writer.add_scalar("diag/gpu_mem_reserved_mb_epoch",
+                              torch.cuda.max_memory_reserved(device) / 1024.0 / 1024.0,
+                              epoch)
+            torch.cuda.reset_peak_memory_stats(device)
 
         ckpt = {
             "epoch": epoch,

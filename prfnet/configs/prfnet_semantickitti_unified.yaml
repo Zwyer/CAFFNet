@@ -44,10 +44,10 @@ data:
 
 model:
   pb_in: 9
-  enc_channels: [96, 192, 384, 384]
+  enc_channels: [64, 128, 256, 256] # 原[96,192,384,384]
   dec_out_c: 64
   head_dropout: 0.10
-  expand_ratios: [2, 4, 6, 6]
+  expand_ratios: [2, 2, 4, 4]
   rv_strides: [[1,2],[2,2],[2,2],[2,2]]
   pb_strides: [[2,2],[2,2],[2,2],[2,2]]
   aspp_rates: [1, 3, 6, 9]

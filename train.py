@@ -104,6 +104,17 @@ class IoUMetric:
         return float(np.nanmean(iou))
 
 
+def _batch_class_hist(labels: torch.Tensor,
+                      num_classes: int,
+                      ignore_index: int) -> np.ndarray:
+    """统计一个 batch 的类别直方图（忽略 ignore_index）。"""
+    valid = labels != ignore_index
+    if not valid.any():
+        return np.zeros(num_classes, dtype=np.float64)
+    hist = torch.bincount(labels[valid].view(-1), minlength=num_classes)
+    return hist.detach().cpu().numpy().astype(np.float64)
+
+
 # ─────────────────────────────────────────────────────────────
 # 辅助：生成像素级标签（用于辅助损失）
 # ─────────────────────────────────────────────────────────────
@@ -484,6 +495,15 @@ def main(args):
         epoch_loss = 0.
         epoch_ce = epoch_lov = epoch_aux = 0.
         t0 = time.time()
+        epoch_step_time = 0.0
+        epoch_data_time = 0.0
+        epoch_grad_norm = 0.0
+        epoch_points_valid = 0.0
+        epoch_points_total = 0.0
+        epoch_rv_occ = 0.0
+        epoch_pb_occ = 0.0
+        epoch_cls_hist = np.zeros(dc['num_classes'], dtype=np.float64)
+        _iter_t_prev = time.time()
 
         # 原型漂移诊断：保存本 epoch 开始时的原型快照
         if model.aggregator.use_proto:
@@ -491,6 +511,8 @@ def main(args):
 
         for step, batch in enumerate(train_loader, 1):
             global_step += 1
+            _iter_t_now = time.time()
+            data_dt = _iter_t_now - _iter_t_prev
 
             rv_img    = batch['rv_img'].to(device, non_blocking=True)
             pb_img    = batch['pb_img'].to(device, non_blocking=True)
@@ -499,6 +521,8 @@ def main(args):
             points    = batch['points'].to(device, non_blocking=True)
             labels    = batch['labels'].to(device, non_blocking=True)
             rv_labels = batch['rv_labels'].to(device, non_blocking=True)  # (B,H,W)
+            labels_cpu = batch['labels']  # cpu 统计用
+            _step_t0 = time.time()
 
             optimizer.zero_grad()
 
@@ -509,7 +533,7 @@ def main(args):
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), tc['grad_clip'])
+            grad_norm = nn.utils.clip_grad_norm_(model.parameters(), tc['grad_clip'])
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
@@ -520,6 +544,20 @@ def main(args):
             epoch_ce   += loss_dict['ce'].item()
             epoch_lov  += loss_dict['lovász'].item()
             epoch_aux  += loss_dict['aux'].item()
+            epoch_data_time += data_dt
+            epoch_step_time += (time.time() - _step_t0)
+            epoch_grad_norm += float(grad_norm.detach().cpu().item()
+                                     if torch.is_tensor(grad_norm) else grad_norm)
+
+            # 数据质量/分布统计
+            valid_mask = labels_cpu != dc['ignore_index']
+            epoch_points_valid += float(valid_mask.sum().item())
+            epoch_points_total += float(labels_cpu.numel())
+            epoch_rv_occ += float((batch['rv_img'][:, 3:4] > 0).float().mean().item())
+            epoch_pb_occ += float(batch['pb_img'][:, 8:9].float().mean().item())
+            epoch_cls_hist += _batch_class_hist(
+                labels_cpu, dc['num_classes'], dc['ignore_index']
+            )
 
             # 步级日志：终端始终打印，log_steps=false 时不写入文件
             if step % lgc['log_interval'] == 0:
@@ -531,7 +569,8 @@ def main(args):
                     f'loss={avg:.4f}  ce={loss_dict["ce"]:.4f}  '
                     f'lov={loss_dict["lovász"]:.4f}  '
                     f'aux={loss_dict["aux"]:.4f}  '
-                    f'lr={lr:.2e}'
+                    f'lr={lr:.2e}  '
+                    f'gnorm={float(grad_norm):.2f}'
                 )
                 print(step_msg, flush=True)          # 终端始终可见
                 if lgc.get('log_steps', True):
@@ -541,6 +580,20 @@ def main(args):
                 writer.add_scalar('train/lovász_step', loss_dict['lovász'],  global_step)
                 writer.add_scalar('train/aux_step',    loss_dict['aux'],     global_step)
                 writer.add_scalar('train/lr',          lr,                   global_step)
+                writer.add_scalar('diag/grad_norm_step', float(grad_norm), global_step)
+                writer.add_scalar('diag/rv_occ_step', float((batch['rv_img'][:, 3:4] > 0).float().mean().item()), global_step)
+                writer.add_scalar('diag/pb_occ_step', float(batch['pb_img'][:, 8:9].float().mean().item()), global_step)
+                writer.add_scalar('diag/points_valid_ratio_step',
+                                  float(valid_mask.sum().item()) / max(float(labels_cpu.numel()), 1.0),
+                                  global_step)
+                if device.type == 'cuda':
+                    writer.add_scalar('diag/gpu_mem_alloc_mb_step',
+                                      torch.cuda.memory_allocated(device) / 1024.0 / 1024.0,
+                                      global_step)
+                    writer.add_scalar('diag/gpu_mem_reserved_mb_step',
+                                      torch.cuda.memory_reserved(device) / 1024.0 / 1024.0,
+                                      global_step)
+            _iter_t_prev = time.time()
 
         # Epoch 级日志
         n = len(train_loader)
@@ -557,6 +610,28 @@ def main(args):
         writer.add_scalar('train/ce_epoch',     epoch_ce   / n, epoch)
         writer.add_scalar('train/lovász_epoch', epoch_lov  / n, epoch)
         writer.add_scalar('train/aux_epoch',    epoch_aux  / n, epoch)
+        writer.add_scalar('diag/step_time_s_epoch', epoch_step_time / n, epoch)
+        writer.add_scalar('diag/data_time_s_epoch', epoch_data_time / n, epoch)
+        writer.add_scalar('diag/grad_norm_epoch', epoch_grad_norm / n, epoch)
+        writer.add_scalar('diag/rv_occ_epoch', epoch_rv_occ / n, epoch)
+        writer.add_scalar('diag/pb_occ_epoch', epoch_pb_occ / n, epoch)
+        writer.add_scalar(
+            'diag/points_valid_ratio_epoch',
+            epoch_points_valid / max(epoch_points_total, 1.0), epoch
+        )
+        cls_hist_sum = epoch_cls_hist.sum()
+        if cls_hist_sum > 0:
+            cls_freq = epoch_cls_hist / cls_hist_sum
+            for i, name in enumerate(CLASS_NAMES):
+                writer.add_scalar(f'data/class_freq_{name}', float(cls_freq[i]), epoch)
+        if device.type == 'cuda':
+            writer.add_scalar('diag/gpu_mem_alloc_mb_epoch',
+                              torch.cuda.max_memory_allocated(device) / 1024.0 / 1024.0,
+                              epoch)
+            writer.add_scalar('diag/gpu_mem_reserved_mb_epoch',
+                              torch.cuda.max_memory_reserved(device) / 1024.0 / 1024.0,
+                              epoch)
+            torch.cuda.reset_peak_memory_stats(device)
 
         # ── 诊断指标（VCG gate entropy + SPM proto drift）──────
         diag = model.aggregator.get_and_reset_diagnostics()
@@ -589,7 +664,7 @@ def main(args):
 
         # ── 验证 ──────────────────────────────────────────
         if epoch % tc['val_every'] == 0:
-            miou, per_cls = evaluate(
+            miou, per_cls, per_prec, per_rec, dist_iou = evaluate(
                 ema_model, val_loader, device,
                 dc['num_classes'], dc['ignore_index'],
                 use_knn=ec.get('use_knn', False),
@@ -606,11 +681,36 @@ def main(args):
                 for name, iou in zip(CLASS_NAMES, per_cls)
             )
             logger.info(f'   Per-class: {cls_line}')
+            prec_line = '  '.join(
+                f'{name[:6]}:{p:.1f}' if not np.isnan(p) else f'{name[:6]}:--'
+                for name, p in zip(CLASS_NAMES, per_prec)
+            )
+            rec_line = '  '.join(
+                f'{name[:6]}:{r:.1f}' if not np.isnan(r) else f'{name[:6]}:--'
+                for name, r in zip(CLASS_NAMES, per_rec)
+            )
+            logger.info(f'   Precision: {prec_line}')
+            logger.info(f'   Recall:    {rec_line}')
+            logger.info(
+                '   Dist-IoU: '
+                f"near={dist_iou.get('near', float('nan')):.2f}%  "
+                f"mid={dist_iou.get('mid', float('nan')):.2f}%  "
+                f"far={dist_iou.get('far', float('nan')):.2f}%"
+            )
 
             writer.add_scalar('val/mIoU', miou, epoch)
             for name, iou in zip(CLASS_NAMES, per_cls):
                 if not np.isnan(iou):
                     writer.add_scalar(f'val/iou_{name}', iou, epoch)
+            for name, p in zip(CLASS_NAMES, per_prec):
+                if not np.isnan(p):
+                    writer.add_scalar(f'val/precision_{name}', p, epoch)
+            for name, r in zip(CLASS_NAMES, per_rec):
+                if not np.isnan(r):
+                    writer.add_scalar(f'val/recall_{name}', r, epoch)
+            for k, v in dist_iou.items():
+                if np.isfinite(v):
+                    writer.add_scalar(f'val/dist_iou_{k}', v, epoch)
 
             # 保存 checkpoint
             ckpt = {
@@ -678,6 +778,12 @@ def evaluate(model, loader, device, num_classes, ignore_index,
     """
     model.eval()
     metric = IoUMetric(num_classes, ignore_index)
+    cm = np.zeros((num_classes, num_classes), dtype=np.int64)
+    # 距离分段统计：near/mid/far
+    bins = [(0.0, 20.0), (20.0, 40.0), (40.0, np.inf)]
+    bin_names = ['near', 'mid', 'far']
+    bin_inter = {k: np.zeros(num_classes, dtype=np.float64) for k in bin_names}
+    bin_union = {k: np.zeros(num_classes, dtype=np.float64) for k in bin_names}
 
     def _refine_batch(preds_np, labels_np, rv_coords_np, pb_coords_np):
         """在线程池内并行精化一个 batch 内的所有样本，返回精化后的 preds (B, N) ndarray"""
@@ -730,6 +836,15 @@ def evaluate(model, loader, device, num_classes, ignore_index,
             preds_refined = torch.from_numpy(
                 np.stack(refined_list, axis=0))          # (B, N)
             metric.update(preds_refined, pending_labels)
+            # 混淆矩阵
+            p = preds_refined.numpy().reshape(-1).astype(np.int64)
+            g = pending_labels.numpy().reshape(-1).astype(np.int64)
+            valid = g != ignore_index
+            if valid.any():
+                idx = g[valid] * num_classes + p[valid]
+                cm += np.bincount(
+                    idx, minlength=num_classes * num_classes
+                ).reshape(num_classes, num_classes)
 
         # ── 3. GPU forward ─────────────────────────────────────
         outputs = model(rv_img, pb_img, rv_coords, pb_coords, points)
@@ -749,6 +864,14 @@ def evaluate(model, loader, device, num_classes, ignore_index,
             pending_labels = labels
         else:
             metric.update(preds, labels)
+            p = preds.numpy().reshape(-1).astype(np.int64)
+            g = labels.numpy().reshape(-1).astype(np.int64)
+            valid = g != ignore_index
+            if valid.any():
+                idx = g[valid] * num_classes + p[valid]
+                cm += np.bincount(
+                    idx, minlength=num_classes * num_classes
+                ).reshape(num_classes, num_classes)
             pending_future = None
             pending_labels = None
 
@@ -757,12 +880,57 @@ def evaluate(model, loader, device, num_classes, ignore_index,
         refined_list = pending_future.result()
         preds_refined = torch.from_numpy(np.stack(refined_list, axis=0))
         metric.update(preds_refined, pending_labels)
+        p = preds_refined.numpy().reshape(-1).astype(np.int64)
+        g = pending_labels.numpy().reshape(-1).astype(np.int64)
+        valid = g != ignore_index
+        if valid.any():
+            idx = g[valid] * num_classes + p[valid]
+            cm += np.bincount(
+                idx, minlength=num_classes * num_classes
+            ).reshape(num_classes, num_classes)
 
     if knn_executor is not None:
         knn_executor.shutdown(wait=False)
 
+    # 距离分段 IoU（需要原始 points）
+    for batch in loader:
+        rv_img    = batch['rv_img'].to(device)
+        pb_img    = batch['pb_img'].to(device)
+        rv_coords = batch['rv_coords'].to(device)
+        pb_coords = batch['pb_coords'].to(device)
+        points    = batch['points'].to(device)
+        labels    = batch['labels']  # cpu
+
+        outputs = model(rv_img, pb_img, rv_coords, pb_coords, points)
+        preds = outputs['logits'].argmax(dim=-1).cpu().numpy().astype(np.int64)
+        gts   = labels.numpy().astype(np.int64)
+        dist  = torch.norm(points[..., :3], dim=-1).cpu().numpy()
+        for b in range(preds.shape[0]):
+            for (lo, hi), name in zip(bins, bin_names):
+                m = (dist[b] >= lo) & (dist[b] < hi) & (gts[b] != ignore_index)
+                if not np.any(m):
+                    continue
+                p = preds[b][m]
+                g = gts[b][m]
+                idx = g * num_classes + p
+                cm_bin = np.bincount(
+                    idx, minlength=num_classes * num_classes
+                ).reshape(num_classes, num_classes)
+                inter = np.diag(cm_bin).astype(np.float64)
+                union = cm_bin.sum(1) + cm_bin.sum(0) - np.diag(cm_bin)
+                bin_inter[name] += inter
+                bin_union[name] += union
+
+    precision = np.where(cm.sum(axis=0) > 0, np.diag(cm) / (cm.sum(axis=0) + 1e-10), np.nan) * 100.0
+    recall    = np.where(cm.sum(axis=1) > 0, np.diag(cm) / (cm.sum(axis=1) + 1e-10), np.nan) * 100.0
+    dist_iou = {}
+    for name in bin_names:
+        valid = bin_union[name] > 0
+        iou = np.where(valid, bin_inter[name] / (bin_union[name] + 1e-10), np.nan) * 100.0
+        dist_iou[name] = float(np.nanmean(iou)) if np.any(valid) else float('nan')
+
     model.train()
-    return metric.miou(), metric.per_class_iou()
+    return metric.miou(), metric.per_class_iou(), precision, recall, dist_iou
 
 
 # ─────────────────────────────────────────────────────────────
