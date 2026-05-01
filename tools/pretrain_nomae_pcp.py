@@ -16,6 +16,7 @@ import sys
 from collections import deque
 from typing import Tuple
 
+import math
 import numpy as np
 import torch
 import yaml
@@ -275,6 +276,8 @@ def main() -> None:
     epochs = int(pc.get("epochs", 10))
 
     global_step = 0
+    overflow_steps = 0
+    skipped_sched_steps = 0
     model.train()
     for epoch in range(1, epochs + 1):
         t0 = time.time()
@@ -345,19 +348,42 @@ def main() -> None:
                 loss_dict = criterion(outputs)
                 loss = loss_dict["total"]
 
+            if amp_enabled_global:
+                scale_before = float(scaler.get_scale())
+            else:
+                scale_before = 1.0
+
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
+            grad_norm_val = float(grad_norm.detach().cpu().item()
+                                  if torch.is_tensor(grad_norm) else grad_norm)
+            grad_is_finite = math.isfinite(grad_norm_val)
+            if not grad_is_finite:
+                overflow_steps += 1
+
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step()
+
+            if amp_enabled_global:
+                # AMP overflow 时 optimizer.step 会被跳过，scale 会下降。
+                scale_after = float(scaler.get_scale())
+                optimizer_stepped = scale_after >= scale_before
+            else:
+                optimizer_stepped = True
+
+            if optimizer_stepped:
+                scheduler.step()
+            else:
+                skipped_sched_steps += 1
 
             ep_total += float(loss.item())
             ep_occ += float(loss_dict["occ"].item())
             ep_pcp += float(loss_dict["pcp"].item())
             ep_step_time += (time.time() - _step_t0)
-            ep_grad_norm += float(grad_norm.detach().cpu().item()
-                                  if torch.is_tensor(grad_norm) else grad_norm)
+            if grad_is_finite:
+                ep_grad_norm += grad_norm_val
             ep_rv_occ += float((rv_img[:, 3:4] > 0).float().mean().item())
             ep_pb_occ += float(pb_img[:, 8:9].float().mean().item())
             ep_mask_rv += float(outputs["rv_mask_ratio"].item())
@@ -371,10 +397,11 @@ def main() -> None:
 
             ma_occ.append(float(loss_dict["occ"].item()))
             ma_pcp.append(float(loss_dict["pcp"].item()))
-            ma_gn.append(float(grad_norm))
+            if grad_is_finite:
+                ma_gn.append(grad_norm_val)
             occ_ma = _ma(ma_occ)
             pcp_ma = _ma(ma_pcp)
-            gn_ma = _ma(ma_gn)
+            gn_ma = _ma(ma_gn) if len(ma_gn) > 0 else float("inf")
 
             if early_stop_enable and len(ma_occ) >= max(1, early_stop_window):
                 if occ_ma < early_stop_occ_thr and pcp_ma < early_stop_pcp_thr and gn_ma < early_stop_gnorm_thr:
@@ -394,7 +421,8 @@ def main() -> None:
             writer.add_scalar("pretrain/occ_ma", occ_ma, global_step)
             writer.add_scalar("pretrain/pcp_ma", pcp_ma, global_step)
             writer.add_scalar("diag/gnorm_ma", gn_ma, global_step)
-            writer.add_scalar("diag/grad_norm_step", float(grad_norm), global_step)
+            writer.add_scalar("diag/grad_norm_step", grad_norm_val, global_step)
+            writer.add_scalar("diag/grad_norm_finite_step", 1.0 if grad_is_finite else 0.0, global_step)
             writer.add_scalar("diag/data_time_s_step", data_dt, global_step)
             writer.add_scalar("diag/step_time_s_step", time.time() - _step_t0, global_step)
             writer.add_scalar("diag/rv_occ_step", float((rv_img[:, 3:4] > 0).float().mean().item()), global_step)
@@ -406,6 +434,8 @@ def main() -> None:
             writer.add_scalar("diag/mask_resample_rv_step", rv_mask_resample, global_step)
             writer.add_scalar("diag/mask_resample_pb_step", pb_mask_resample, global_step)
             writer.add_scalar("diag/early_stop_counter_step", early_stop_counter, global_step)
+            writer.add_scalar("diag/overflow_steps_step", overflow_steps, global_step)
+            writer.add_scalar("diag/skipped_sched_steps_step", skipped_sched_steps, global_step)
             if labels_cpu is not None:
                 valid = labels_cpu != 255
                 writer.add_scalar(
@@ -426,8 +456,9 @@ def main() -> None:
                     f"[pretrain] ep={epoch:03d}/{epochs} step={step:04d}/{(len(loader) if loader is not None else 1)} "
                     f"loss={ep_total/step:.4f} occ={loss_dict['occ']:.4f} "
                     f"pcp={loss_dict['pcp']:.4f} lr={lr:.2e} "
-                    f"gnorm={float(grad_norm):.2f} "
-                    f"occ_ma={occ_ma:.4e} pcp_ma={pcp_ma:.4e} gnorm_ma={gn_ma:.4f}",
+                    f"gnorm={grad_norm_val:.2f} "
+                    f"occ_ma={occ_ma:.4e} pcp_ma={pcp_ma:.4e} gnorm_ma={gn_ma:.4f} "
+                    f"overflow={overflow_steps} sched_skip={skipped_sched_steps}",
                 )
 
             if early_stop_enable and early_stop_counter >= max(1, early_stop_patience_steps):
@@ -464,7 +495,9 @@ def main() -> None:
         writer.add_scalar("pretrain/pcp_epoch", ep_pcp / n, epoch)
         writer.add_scalar("pretrain/rv_mask_ratio_epoch", ep_mask_rv / n, epoch)
         writer.add_scalar("pretrain/pb_mask_ratio_epoch", ep_mask_pb / n, epoch)
-        writer.add_scalar("diag/grad_norm_epoch", ep_grad_norm / n, epoch)
+        writer.add_scalar("diag/grad_norm_epoch", ep_grad_norm / max(1, len(ma_gn)), epoch)
+        writer.add_scalar("diag/overflow_steps_epoch", overflow_steps, epoch)
+        writer.add_scalar("diag/skipped_sched_steps_epoch", skipped_sched_steps, epoch)
         writer.add_scalar("diag/rv_occ_epoch", ep_rv_occ / n, epoch)
         writer.add_scalar("diag/pb_occ_epoch", ep_pb_occ / n, epoch)
         writer.add_scalar("diag/step_time_s_epoch", ep_step_time / n, epoch)
