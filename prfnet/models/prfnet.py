@@ -12,7 +12,10 @@ from .modules import (
     LightEncoder, LightDecoder, AAFF, DepthStratifiedAAFF,
     PointSampleAggregator, AuxHead, conv_bn_relu6,
 )
-from .pretrain_heads import NOMAEPCPPretrainHead, build_random_mask_like
+from .pretrain_heads import (
+    NOMAEPCPPretrainHead,
+    build_mask_with_pos_ratio_control,
+)
 
 
 class PRFNet(nn.Module):
@@ -56,6 +59,7 @@ class PRFNet(nn.Module):
         super().__init__()
         self.num_classes = num_classes
         self.rv_in = rv_in   # 保存供 export_onnx 使用，避免硬编码通道数
+        self.pb_in = pb_in
 
         # ── 双分支 stem（输出同时作为 decoder 最终跳连接）─────
         # LightEncoder 无内部 stem，避免双重 stem
@@ -106,6 +110,8 @@ class PRFNet(nn.Module):
         # ── 预训练头（NOMAE + PCP，训练期可选启用）──────────────
         self.pretrain_head_rv = NOMAEPCPPretrainHead(dec_out_c)
         self.pretrain_head_pb = NOMAEPCPPretrainHead(dec_out_c)
+        self.rv_mask_token = nn.Parameter(torch.zeros(1, rv_in, 1, 1))
+        self.pb_mask_token = nn.Parameter(torch.zeros(1, pb_in, 1, 1))
 
     # ─────────────────────────────────────────────────────────
 
@@ -172,6 +178,18 @@ class PRFNet(nn.Module):
         pb_img: torch.Tensor,
         rv_mask_ratio: float = 0.7,
         pb_mask_ratio: float = 0.7,
+        input_masking_enable: bool = True,
+        input_masking_mode: str = "zero",
+        mask_pos_ratio_control_enable: bool = False,
+        mask_pos_ratio_min: float = 0.08,
+        mask_pos_ratio_max: float = 0.50,
+        mask_resample_max_tries: int = 5,
+        occ_scales: Optional[List[int]] = None,
+        occ_loss_type: str = "bce_pos_weight",
+        occ_pos_weight: float = 5.0,
+        occ_focal_gamma: float = 2.0,
+        pcp_stopgrad_replace: bool = True,
+        informative_occ_only: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """
         Self-supervised pretraining forward.
@@ -180,29 +198,75 @@ class PRFNet(nn.Module):
 
         Returns dict with losses and diagnostics.
         """
-        fused_rv, fused_pb, rv_stem, pb_stem = self._encode(rv_img, pb_img)
+        # Targets from original inputs.
+        rv_occ_tgt = (rv_img[:, 3:4] > 0).float()
+        pb_occ_tgt = pb_img[:, 8:9].float()
+        rv_center_tgt = rv_img[:, 0:3]
+        pb_center_tgt = pb_img[:, 0:3]
+
+        # Build masks (optionally occupancy-aware).
+        rv_mask, rv_resample = build_mask_with_pos_ratio_control(
+            rv_img,
+            rv_occ_tgt,
+            rv_mask_ratio,
+            enable_control=mask_pos_ratio_control_enable,
+            min_pos_ratio=mask_pos_ratio_min,
+            max_pos_ratio=mask_pos_ratio_max,
+            max_tries=mask_resample_max_tries,
+        )
+        pb_mask, pb_resample = build_mask_with_pos_ratio_control(
+            pb_img,
+            pb_occ_tgt,
+            pb_mask_ratio,
+            enable_control=mask_pos_ratio_control_enable,
+            min_pos_ratio=mask_pos_ratio_min,
+            max_pos_ratio=mask_pos_ratio_max,
+            max_tries=mask_resample_max_tries,
+        )
+
+        # Input-level masking to block leakage shortcuts.
+        if input_masking_enable:
+            mode = str(input_masking_mode).lower()
+            if mode == "zero":
+                rv_img_in = rv_img * (1.0 - rv_mask)
+                pb_img_in = pb_img * (1.0 - pb_mask)
+            elif mode == "token":
+                rv_tok = self.rv_mask_token.expand(rv_img.shape[0], -1, rv_img.shape[2], rv_img.shape[3])
+                pb_tok = self.pb_mask_token.expand(pb_img.shape[0], -1, pb_img.shape[2], pb_img.shape[3])
+                rv_img_in = rv_img * (1.0 - rv_mask) + rv_tok * rv_mask
+                pb_img_in = pb_img * (1.0 - pb_mask) + pb_tok * pb_mask
+            else:
+                # Fallback to zero-mask for unsupported modes.
+                rv_img_in = rv_img * (1.0 - rv_mask)
+                pb_img_in = pb_img * (1.0 - pb_mask)
+        else:
+            rv_img_in = rv_img
+            pb_img_in = pb_img
+
+        fused_rv, fused_pb, rv_stem, pb_stem = self._encode(rv_img_in, pb_img_in)
         rv_out = self.rv_dec(fused_rv, rv_stem)   # (B, dec_out_c, H_rv, W)
         pb_out = self.pb_dec(fused_pb, pb_stem)   # (B, dec_out_c, H_pb, W)
 
-        rv_mask = build_random_mask_like(rv_out, rv_mask_ratio)
-        pb_mask = build_random_mask_like(pb_out, pb_mask_ratio)
-
-        # Targets from input projections:
-        # RV occupancy uses r/R channel (ch=3): >0 indicates valid cell.
-        rv_occ_tgt = (rv_img[:, 3:4] > 0).float()
-        pb_occ_tgt = pb_img[:, 8:9].float()  # PB occ channel.
-
-        # PCP center proxy:
-        # RV uses normalized xyz channels directly.
-        rv_center_tgt = rv_img[:, 0:3]
-        # PB uses mean xyz channels.
-        pb_center_tgt = pb_img[:, 0:3]
+        # Sync pretrain head options dynamically from config.
+        if occ_scales is not None and len(occ_scales) == len(self.pretrain_head_rv.occ_scales):
+            self.pretrain_head_rv.occ_scales = [int(max(1, s)) for s in occ_scales]
+            self.pretrain_head_pb.occ_scales = [int(max(1, s)) for s in occ_scales]
+        self.pretrain_head_rv.occ_loss_type = str(occ_loss_type).lower()
+        self.pretrain_head_pb.occ_loss_type = str(occ_loss_type).lower()
+        self.pretrain_head_rv.occ_pos_weight = float(max(1e-6, occ_pos_weight))
+        self.pretrain_head_pb.occ_pos_weight = float(max(1e-6, occ_pos_weight))
+        self.pretrain_head_rv.occ_focal_gamma = float(max(0.0, occ_focal_gamma))
+        self.pretrain_head_pb.occ_focal_gamma = float(max(0.0, occ_focal_gamma))
+        self.pretrain_head_rv.pcp_stopgrad_replace = bool(pcp_stopgrad_replace)
+        self.pretrain_head_pb.pcp_stopgrad_replace = bool(pcp_stopgrad_replace)
 
         rv_ret = self.pretrain_head_rv(
-            rv_out, rv_mask, rv_occ_tgt, rv_center_tgt
+            rv_out, rv_mask, rv_occ_tgt, rv_center_tgt,
+            informative_only=informative_occ_only,
         )
         pb_ret = self.pretrain_head_pb(
-            pb_out, pb_mask, pb_occ_tgt, pb_center_tgt
+            pb_out, pb_mask, pb_occ_tgt, pb_center_tgt,
+            informative_only=informative_occ_only,
         )
 
         return {
@@ -212,6 +276,12 @@ class PRFNet(nn.Module):
             "loss_pcp_pb": pb_ret["loss_pcp"],
             "rv_mask_ratio": rv_mask.mean().detach(),
             "pb_mask_ratio": pb_mask.mean().detach(),
+            "rv_masked_pos_ratio": rv_ret["masked_pos_ratio"],
+            "pb_masked_pos_ratio": pb_ret["masked_pos_ratio"],
+            "rv_occ_effective_ratio": rv_ret["occ_effective_ratio"],
+            "pb_occ_effective_ratio": pb_ret["occ_effective_ratio"],
+            "rv_mask_resample": rv_resample.detach(),
+            "pb_mask_resample": pb_resample.detach(),
         }
 
     # ─────────────────────────────────────────────────────────

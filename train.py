@@ -19,7 +19,7 @@ import yaml
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 from torch.optim.swa_utils import AveragedModel
 
@@ -113,6 +113,81 @@ def _batch_class_hist(labels: torch.Tensor,
         return np.zeros(num_classes, dtype=np.float64)
     hist = torch.bincount(labels[valid].view(-1), minlength=num_classes)
     return hist.detach().cpu().numpy().astype(np.float64)
+
+
+def _build_low_label_subset(dataset: SemanticKITTIDataset,
+                            subset_frames: int,
+                            subset_seed: int,
+                            balance_by_seq: bool = True):
+    """
+    从 train split 采样固定帧数，构造低标注子集（100/200 帧等）。
+    返回：
+      subset_ds:   torch.utils.data.Subset
+      chosen_idx:  选中的原始帧索引（升序）
+      seq_counts:  各序列命中帧数
+    """
+    total = len(dataset)
+    if subset_frames <= 0 or subset_frames >= total:
+        all_idx = np.arange(total, dtype=np.int64)
+        seq_counts = {}
+        for i in all_idx.tolist():
+            seq = dataset.frames[i]['seq']
+            seq_counts[seq] = seq_counts.get(seq, 0) + 1
+        return Subset(dataset, all_idx.tolist()), all_idx.tolist(), seq_counts
+
+    rng = np.random.default_rng(subset_seed)
+
+    if not balance_by_seq:
+        chosen = np.sort(rng.choice(total, size=subset_frames, replace=False)).astype(np.int64)
+    else:
+        seq_to_idx = {}
+        for i, frame in enumerate(dataset.frames):
+            seq_to_idx.setdefault(frame['seq'], []).append(i)
+        seqs = sorted(seq_to_idx.keys())
+
+        # 按序列平均分配，再按剩余容量补齐
+        base = subset_frames // len(seqs)
+        rem = subset_frames % len(seqs)
+        alloc = {s: base for s in seqs}
+        for s in seqs[:rem]:
+            alloc[s] += 1
+
+        chosen_list = []
+        spill = 0
+        for s in seqs:
+            idxs = np.asarray(seq_to_idx[s], dtype=np.int64)
+            want = alloc[s]
+            take = min(want, len(idxs))
+            if take > 0:
+                pick = rng.choice(idxs, size=take, replace=False)
+                chosen_list.extend(pick.tolist())
+            spill += (want - take)
+
+        if spill > 0:
+            chosen_set = set(chosen_list)
+            pool = np.asarray([i for i in range(total) if i not in chosen_set], dtype=np.int64)
+            if len(pool) > 0:
+                extra_take = min(spill, len(pool))
+                extra = rng.choice(pool, size=extra_take, replace=False)
+                chosen_list.extend(extra.tolist())
+
+        chosen = np.sort(np.asarray(chosen_list, dtype=np.int64))
+        # 极端情况下若不足（例如 total<subset_frames，理论上前面已拦截），做保护
+        if len(chosen) < subset_frames:
+            remain_pool = np.asarray([i for i in range(total) if i not in set(chosen.tolist())], dtype=np.int64)
+            need = min(subset_frames - len(chosen), len(remain_pool))
+            if need > 0:
+                more = rng.choice(remain_pool, size=need, replace=False)
+                chosen = np.sort(np.concatenate([chosen, more.astype(np.int64)], axis=0))
+        if len(chosen) > subset_frames:
+            chosen = np.sort(rng.choice(chosen, size=subset_frames, replace=False)).astype(np.int64)
+
+    seq_counts = {}
+    for i in chosen.tolist():
+        seq = dataset.frames[int(i)]['seq']
+        seq_counts[seq] = seq_counts.get(seq, 0) + 1
+
+    return Subset(dataset, chosen.tolist()), chosen.tolist(), seq_counts
 
 
 # ─────────────────────────────────────────────────────────────
@@ -362,6 +437,38 @@ def main(args):
         cp_min_keep=cp_cfg.get('min_keep_pts', 15),
         cp_max_tries=cp_cfg.get('max_tries', 50),
     )
+    full_train_len = len(train_ds)
+    low_label_cfg = dc.get('low_label_finetune', {})
+    ll_enable = bool(low_label_cfg.get('enable', False))
+    ll_frames = int(low_label_cfg.get('num_frames', 0))
+    ll_seed = int(low_label_cfg.get('seed', seed))
+    ll_balance_by_seq = bool(low_label_cfg.get('balance_by_seq', True))
+    ll_dump_path = low_label_cfg.get('dump_indices_path', 'selected_train_indices.txt')
+    if ll_enable and ll_frames > 0:
+        train_ds, chosen_idx, seq_counts = _build_low_label_subset(
+            train_ds, subset_frames=ll_frames, subset_seed=ll_seed,
+            balance_by_seq=ll_balance_by_seq,
+        )
+        logger.info(
+            f'Low-label finetune enabled: sampled {len(chosen_idx)} train frames '
+            f'(seed={ll_seed}, balance_by_seq={ll_balance_by_seq})'
+        )
+        logger.info(
+            'Low-label seq distribution: ' +
+            ', '.join([f'{k}:{v}' for k, v in sorted(seq_counts.items())])
+        )
+        if ll_dump_path:
+            ll_dump_abs = os.path.join(exp_dir, ll_dump_path)
+            with open(ll_dump_abs, 'w', encoding='utf-8') as f:
+                for i in chosen_idx:
+                    frame = train_ds.dataset.frames[int(i)]
+                    velo_path = frame['velo']
+                    stem = os.path.splitext(os.path.basename(velo_path))[0]
+                    f.write(f'{frame["seq"]}/{stem}\tidx={int(i)}\n')
+            logger.info(f'Low-label frame list saved: {ll_dump_abs}')
+    else:
+        logger.info('Low-label finetune disabled: using full train split.')
+
     val_ds = SemanticKITTIDataset(
         root=dc['root'], split='val',
         rv_H=dc['rv_H'], rv_W=dc['rv_W'],
@@ -387,6 +494,9 @@ def main(args):
     )
 
     logger.info(f'Train: {len(train_ds)} frames  |  Val: {len(val_ds)} frames')
+    writer.add_scalar('data/train_frames', float(len(train_ds)), 0)
+    writer.add_scalar('data/train_frames_ratio_to_full',
+                      float(len(train_ds)) / max(float(full_train_len), 1.0), 0)
 
     # ── 模型 ───────────────────────────────────────────────
     model = PRFNet(
