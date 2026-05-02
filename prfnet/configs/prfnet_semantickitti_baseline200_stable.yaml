@@ -14,21 +14,21 @@ data:
   fov_up: 2.0
   fov_down: -24.8
   R_max: 85.0
-  batch_size: 4
+  batch_size: 2
   num_workers: 20
   val_batch_size: 4
   val_num_workers: 24
   augment: true
-  use_polarmix: true
+  use_polarmix: false   # 稳定版 v2：从零低标注训练先关闭强混合增强
   rotate: true
   flip: true
   scale_min: 0.95
   scale_max: 1.05
-  drop_p: 0.05
-  polarmix_p: 0.5
+  drop_p: 0.02
+  polarmix_p: 0.0
   polarmix_sectors: 8
-  use_lasermix: true
-  lasermix_p: 0.5
+  use_lasermix: false
+  lasermix_p: 0.0
   low_label_finetune:
     enable: true
     num_frames: 200      # 改成 100 即可做 100 帧微调
@@ -36,7 +36,7 @@ data:
     balance_by_seq: true
     dump_indices_path: selected_train_indices.txt
   copy_paste:
-    enable: false   # baseline 稳定版：从头训练先关闭 Copy-Paste，减少分布偏移
+    enable: true   # 200帧低标注：开启稀有类增强，避免只学到road/building等大类
     bank_path: "instance_bank_semantickitti.npz"
     classes:
       7: {prob: 0.90, k: 3}
@@ -70,21 +70,21 @@ train:
   epochs: 50
   seed: 42
   optimizer: adamw
-  lr: 3.0e-4        # baseline 稳定版：低标注从头训降低学习率
+  lr: 6.0e-4        # 200帧从零训练：提高早期学习速度，避免长期低mIoU平台
   weight_decay: 1.0e-4
   grad_clip: 10.0
-  scheduler: cosine  # baseline 稳定版：更平滑，降低塌陷风险
+  scheduler: onecycle  # 200帧从零训练：前期更快起量
   pct_start: 0.10
   eta_min: 1.0e-6
   amp: true
-  ema_decay: 0.999
+  ema_decay: 0.99   # 降低EMA滞后，避免前期验证mIoU被明显低估
   val_every: 1
   save_topk_ckpts: 5
 
 loss:
-  lambda_lovasz: 1.5
+  lambda_lovasz: 1.2
   lambda_aux: 0.1
-  use_focal: false   # baseline 稳定版：先用 CE+Lovasz 提高稳定性
+  use_focal: true   # 200帧低标注：增强长尾/难样本梯度
   focal_gamma: 2.0
   label_smoothing: 0.0
   class_weights:
@@ -109,7 +109,7 @@ loss:
     - 8.00
 
 eval:
-  use_knn: false
+  use_knn: true   # 验证阶段更贴近最终效果（通常+1~2 mIoU）
   knn_radius: 1
   knn_dual: false
 
