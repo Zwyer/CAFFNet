@@ -80,7 +80,6 @@ def _ma(values: deque) -> float:
     return float(sum(values) / float(len(values)))
 
 
-@torch.no_grad()
 def run_linear_probe_eval(
     model: PRFNet,
     loader: DataLoader,
