@@ -172,6 +172,49 @@ class PRFNet(nn.Module):
 
         return result
 
+    # ─────────────────────────────────────────────────────────
+    # Cross-view consistency helper
+    # ─────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _cross_view_consistency_loss(
+        rv_out: torch.Tensor,   # (B, C, H_rv, W)
+        pb_out: torch.Tensor,   # (B, C, H_pb, W)
+        rv_mask: torch.Tensor,  # (B, 1, H_rv, W)
+        pb_mask: torch.Tensor,  # (B, 1, H_pb, W)
+        only_visible: bool = True,
+        stop_grad: bool = False,
+    ) -> torch.Tensor:
+        """
+        Cosine-distance loss between azimuth-column–averaged features of RV and PB.
+
+        Both views share the W (azimuth) dimension. After compressing H we get
+        per-column descriptors (B, C, W) that should be mutually consistent for the
+        same scene content observed from different geometric projections.
+
+        only_visible: only compute loss on columns where both views are > 30% unmasked.
+        stop_grad:    if True, stop gradient on the PB branch (asymmetric alignment).
+        """
+        rv_col = rv_out.mean(dim=2)   # (B, C, W)
+        pb_col = pb_out.mean(dim=2)   # (B, C, W)
+
+        if only_visible:
+            rv_vis = (1.0 - rv_mask).squeeze(1).mean(dim=1)   # (B, W)
+            pb_vis = (1.0 - pb_mask).squeeze(1).mean(dim=1)   # (B, W)
+            col_weight = ((rv_vis > 0.3) & (pb_vis > 0.3)).float()
+        else:
+            col_weight = torch.ones(rv_out.shape[0], rv_out.shape[3], device=rv_out.device)
+
+        rv_n = F.normalize(rv_col, dim=1)
+        pb_target = pb_col.detach() if stop_grad else pb_col
+        pb_n = F.normalize(pb_target, dim=1)
+
+        sim = (rv_n * pb_n).sum(dim=1)          # (B, W) cosine similarity
+        loss_map = 1.0 - sim                     # cosine distance in [0, 2]
+
+        n = col_weight.sum().clamp(min=1.0)
+        return (loss_map * col_weight).sum() / n
+
     def forward_pretrain(
         self,
         rv_img: torch.Tensor,
@@ -186,10 +229,13 @@ class PRFNet(nn.Module):
         mask_mix_random: float = 0.5,
         mask_mix_block: float = 0.3,
         mask_mix_band: float = 0.2,
+        mask_mix_hmg: float = 0.0,
         block_h_min: int = 4,
         block_h_max: int = 16,
         block_w_min: int = 16,
         block_w_max: int = 64,
+        hmg_coarse_stride: int = 8,
+        hmg_fine_extra_ratio: float = 0.05,
         mask_pos_ratio_control_enable: bool = False,
         mask_pos_ratio_min: float = 0.08,
         mask_pos_ratio_max: float = 0.50,
@@ -206,13 +252,19 @@ class PRFNet(nn.Module):
         informative_occ_only: bool = True,
         pcp_informative_only: bool = True,
         pcp_pos_weight: float = 1.0,
-        pcp_near_range_max: float = 0.5,
+        pcp_near_range_max: float = 10.0,
         pcp_near_weight: float = 1.5,
+        neighbor_sup_only_visible: bool = True,
+        cross_view_consistency_enable: bool = False,
+        lambda_cv: float = 0.1,
+        cv_stop_grad: bool = False,
+        cv_only_visible: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """
         Self-supervised pretraining forward.
         - NOMAE: occupancy reconstruction on masked cells.
         - PCP: masked center regression.
+        - Cross-view consistency: cosine alignment between RV and PB azimuth columns.
 
         Returns dict with losses and diagnostics.
         """
@@ -232,10 +284,13 @@ class PRFNet(nn.Module):
             mix_random=mask_mix_random,
             mix_block=mask_mix_block,
             mix_band=mask_mix_band,
+            mix_hmg=mask_mix_hmg,
             block_h_min=block_h_min,
             block_h_max=block_h_max,
             block_w_min=block_w_min,
             block_w_max=block_w_max,
+            hmg_coarse_stride=hmg_coarse_stride,
+            hmg_fine_extra_ratio=hmg_fine_extra_ratio,
             enable_control=mask_pos_ratio_control_enable,
             min_pos_ratio=mask_pos_ratio_min,
             max_pos_ratio=mask_pos_ratio_max,
@@ -250,10 +305,13 @@ class PRFNet(nn.Module):
             mix_random=mask_mix_random,
             mix_block=mask_mix_block,
             mix_band=mask_mix_band,
+            mix_hmg=mask_mix_hmg,
             block_h_min=block_h_min,
             block_h_max=block_h_max,
             block_w_min=block_w_min,
             block_w_max=block_w_max,
+            hmg_coarse_stride=hmg_coarse_stride,
+            hmg_fine_extra_ratio=hmg_fine_extra_ratio,
             enable_control=mask_pos_ratio_control_enable,
             min_pos_ratio=mask_pos_ratio_min,
             max_pos_ratio=mask_pos_ratio_max,
@@ -314,14 +372,16 @@ class PRFNet(nn.Module):
             rv_out, rv_mask, rv_occ_tgt, rv_center_tgt,
             informative_only=informative_occ_only,
             pcp_informative_only=pcp_informative_only,
+            neighbor_sup_only_visible=neighbor_sup_only_visible,
         )
         pb_ret = self.pretrain_head_pb(
             pb_out, pb_mask, pb_occ_tgt, pb_center_tgt,
             informative_only=informative_occ_only,
             pcp_informative_only=pcp_informative_only,
+            neighbor_sup_only_visible=neighbor_sup_only_visible,
         )
 
-        return {
+        out = {
             "loss_occ_rv": rv_ret["loss_occ"],
             "loss_occ_pb": pb_ret["loss_occ"],
             "loss_pcp_rv": rv_ret["loss_pcp"],
@@ -335,6 +395,17 @@ class PRFNet(nn.Module):
             "rv_mask_resample": rv_resample.detach(),
             "pb_mask_resample": pb_resample.detach(),
         }
+
+        # Cross-view consistency loss (RV ↔ PB azimuth column alignment)
+        if cross_view_consistency_enable:
+            loss_cv = self._cross_view_consistency_loss(
+                rv_out, pb_out, rv_mask, pb_mask,
+                only_visible=cv_only_visible,
+                stop_grad=cv_stop_grad,
+            )
+            out["loss_cv"] = loss_cv
+
+        return out
 
     @torch.no_grad()
     def extract_pretrain_point_features(

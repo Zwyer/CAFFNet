@@ -274,8 +274,8 @@ def main() -> None:
     np.random.seed(seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if args.dry_run and device.type != "cuda":
-        # Keep memory safe for CPU-only CI/sandbox dry tests.
+    if args.dry_run:
+        # Reduce tensor sizes to keep dry-run fast and within GPU memory.
         dc["rv_H"] = min(int(dc["rv_H"]), 64)
         dc["rv_W"] = min(int(dc["rv_W"]), 256)
         dc["pb_H"] = min(int(dc["pb_H"]), 128)
@@ -341,6 +341,7 @@ def main() -> None:
         lambda_occ_pb=pc.get("lambda_occ_pb", None),
         lambda_pcp_rv=pc.get("lambda_pcp_rv", None),
         lambda_pcp_pb=pc.get("lambda_pcp_pb", None),
+        lambda_cv=float(pc.get("lambda_cv", 0.0)),
     )
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -349,6 +350,12 @@ def main() -> None:
     )
     total_steps = (len(loader) if loader is not None else 1) * int(pc.get("epochs", 10))
     sched_type = str(pc.get("scheduler", "cosine")).lower()
+    amp_enabled_global = bool(pc.get("amp", True)) and device.type == "cuda"
+    scaler = torch.amp.GradScaler(device.type, enabled=amp_enabled_global)
+
+    # ── LR warmup (P2) ────────────────────────────────────────────────────────
+    lr_warmup_ratio = float(pc.get("lr_warmup_ratio", 0.0))
+    warmup_steps = int(total_steps * max(0.0, min(1.0, lr_warmup_ratio))) if sched_type != "onecycle" else 0
     if sched_type == "onecycle":
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
@@ -356,13 +363,28 @@ def main() -> None:
             total_steps=max(total_steps, 1),
             pct_start=float(pc.get("pct_start", 0.1)),
         )
+    elif warmup_steps > 0:
+        warmup_sched = torch.optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=1.0e-3,
+            end_factor=1.0,
+            total_iters=warmup_steps,
+        )
+        cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(total_steps - warmup_steps, 1),
+            eta_min=float(pc.get("eta_min", 1e-6)),
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup_sched, cosine_sched],
+            milestones=[warmup_steps],
+        )
+        logger.info(f"Scheduler: cosine+warmup({lr_warmup_ratio:.0%} = {warmup_steps} steps)")
     else:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=max(total_steps, 1), eta_min=pc.get("eta_min", 1e-6)
         )
-    logger.info(f"Scheduler: {sched_type}")
-    amp_enabled_global = bool(pc.get("amp", True)) and device.type == "cuda"
-    scaler = torch.amp.GradScaler(device.type, enabled=amp_enabled_global)
 
     rv_mask_ratio = float(pc.get("rv_mask_ratio", 0.7))
     pb_mask_ratio = float(pc.get("pb_mask_ratio", 0.7))
@@ -390,14 +412,21 @@ def main() -> None:
     mask_mix_random = float(pc.get("mask_mix_random", 0.5))
     mask_mix_block = float(pc.get("mask_mix_block", 0.3))
     mask_mix_band = float(pc.get("mask_mix_band", 0.2))
+    mask_mix_hmg = float(pc.get("mask_mix_hmg", 0.0))
     block_h_min = int(pc.get("block_h_min", 4))
     block_h_max = int(pc.get("block_h_max", 16))
     block_w_min = int(pc.get("block_w_min", 16))
     block_w_max = int(pc.get("block_w_max", 64))
+    hmg_coarse_stride = int(pc.get("hmg_coarse_stride", 8))
+    hmg_fine_extra_ratio = float(pc.get("hmg_fine_extra_ratio", 0.05))
     pcp_informative_only = bool(pc.get("pcp_informative_only", True))
     occ_pos_weight_adaptive = bool(pc.get("occ_pos_weight_adaptive", False))
     occ_pos_weight_min = float(pc.get("occ_pos_weight_min", 1.0))
     occ_pos_weight_max = float(pc.get("occ_pos_weight_max", 12.0))
+    neighbor_sup_only_visible = bool(pc.get("neighbor_sup_only_visible", True))
+    cross_view_consistency_enable = bool(pc.get("cross_view_consistency_enable", False))
+    cv_stop_grad = bool(pc.get("cv_stop_grad", False))
+    cv_only_visible = bool(pc.get("cv_only_visible", True))
 
     early_stop_enable = bool(pc.get("early_stop_enable", False))
     early_stop_mode = str(pc.get("early_stop_mode", "relative")).lower()
@@ -414,12 +443,15 @@ def main() -> None:
     ma_pcp = deque(maxlen=max(1, early_stop_window))
     ma_gn = deque(maxlen=max(1, early_stop_window))
     occ_rel_hist = deque(maxlen=max(2, early_stop_rel_window + 1))
+    pcp_rel_hist = deque(maxlen=max(2, early_stop_rel_window + 1))  # P2: track PCP relative improvement
 
     logger.info(
         f"Pretrain knobs: input_masking={input_masking_enable}/{input_masking_mode}, "
         f"occ_loss={occ_loss_type}, occ_scales={occ_scales}, "
         f"mask_strategy={mask_strategy}, "
-        f"pos_ratio_control={mask_pos_ratio_control_enable}"
+        f"neighbor_sup_only_visible={neighbor_sup_only_visible}, "
+        f"pos_ratio_control={mask_pos_ratio_control_enable}, "
+        f"cross_view_consistency={cross_view_consistency_enable}"
     )
     if mask_curriculum_enable:
         logger.info(
@@ -444,7 +476,9 @@ def main() -> None:
     probe_weight_decay = float(pc.get("probe_weight_decay", 0.0))
     probe_batch_size = int(pc.get("probe_batch_size", dc.get("batch_size", 2)))
     probe_num_workers = int(pc.get("probe_num_workers", dc.get("num_workers", 8)))
+    probe_patience_epochs = int(pc.get("probe_patience_epochs", 0))   # 0 = disabled
     best_probe_miou = -1.0
+    probe_no_improve_count = 0
 
     probe_train_loader = None
     probe_eval_loader = None
@@ -541,8 +575,15 @@ def main() -> None:
                     informative_occ_only=informative_occ_only,
                     pcp_informative_only=pcp_informative_only,
                     pcp_pos_weight=float(pc.get("pcp_pos_weight", 1.0)),
-                    pcp_near_range_max=float(pc.get("pcp_near_range_max", 0.5)),
+                    pcp_near_range_max=float(pc.get("pcp_near_range_max", 10.0)),
                     pcp_near_weight=float(pc.get("pcp_near_weight", 1.5)),
+                    mask_mix_hmg=mask_mix_hmg,
+                    hmg_coarse_stride=hmg_coarse_stride,
+                    hmg_fine_extra_ratio=hmg_fine_extra_ratio,
+                    neighbor_sup_only_visible=neighbor_sup_only_visible,
+                    cross_view_consistency_enable=cross_view_consistency_enable,
+                    cv_stop_grad=cv_stop_grad,
+                    cv_only_visible=cv_only_visible,
                 )
                 loss_dict = criterion(outputs)
                 loss = loss_dict["total"]
@@ -602,6 +643,7 @@ def main() -> None:
             pcp_ma = _ma(ma_pcp)
             gn_ma = _ma(ma_gn) if len(ma_gn) > 0 else float("inf")
             occ_rel_hist.append(occ_ma)
+            pcp_rel_hist.append(pcp_ma)
 
             if early_stop_enable and len(ma_occ) >= max(1, early_stop_window):
                 if global_step < max(0, early_stop_min_steps):
@@ -615,11 +657,16 @@ def main() -> None:
                         )
                     else:
                         cond = False
-                        if len(occ_rel_hist) >= occ_rel_hist.maxlen:
-                            old = occ_rel_hist[0]
-                            new = occ_rel_hist[-1]
-                            rel_improve = (old - new) / max(abs(old), 1e-8)
-                            cond = (rel_improve < early_stop_rel_tol) and (gn_ma < early_stop_gnorm_thr)
+                        if len(occ_rel_hist) >= occ_rel_hist.maxlen and len(pcp_rel_hist) >= pcp_rel_hist.maxlen:
+                            occ_old = occ_rel_hist[0]; occ_new = occ_rel_hist[-1]
+                            pcp_old = pcp_rel_hist[0]; pcp_new = pcp_rel_hist[-1]
+                            occ_rel_improve = (occ_old - occ_new) / max(abs(occ_old), 1e-8)
+                            pcp_rel_improve = (pcp_old - pcp_new) / max(abs(pcp_old), 1e-8)
+                            cond = (
+                                occ_rel_improve < early_stop_rel_tol
+                                and pcp_rel_improve < early_stop_rel_tol
+                                and gn_ma < early_stop_gnorm_thr
+                            )
                     if cond:
                         early_stop_counter += 1
                     else:
@@ -639,6 +686,8 @@ def main() -> None:
                 writer.add_scalar("pretrain/pcp_rv_step", loss_dict["pcp_rv"], global_step)
             if "pcp_pb" in loss_dict:
                 writer.add_scalar("pretrain/pcp_pb_step", loss_dict["pcp_pb"], global_step)
+            if "cv" in loss_dict:
+                writer.add_scalar("pretrain/cv_step", loss_dict["cv"], global_step)
             writer.add_scalar("pretrain/lr", lr, global_step)
             writer.add_scalar("pretrain/rv_mask_ratio_step", outputs["rv_mask_ratio"], global_step)
             writer.add_scalar("pretrain/pb_mask_ratio_step", outputs["pb_mask_ratio"], global_step)
@@ -767,8 +816,20 @@ def main() -> None:
             logger.info(f"[probe] epoch={epoch:03d} proxy_mIoU={probe_miou:.2f}%")
             if probe_miou > best_probe_miou:
                 best_probe_miou = probe_miou
+                probe_no_improve_count = 0
                 torch.save(ckpt, os.path.join(ckpt_dir, "best_pretrain.pth"))
                 logger.info(f"[probe] new best_pretrain saved: proxy_mIoU={probe_miou:.2f}%")
+            else:
+                probe_no_improve_count += 1
+                logger.info(f"[probe] no improvement ({probe_no_improve_count}/{probe_patience_epochs})")
+            if probe_patience_epochs > 0 and probe_no_improve_count >= probe_patience_epochs:
+                logger.info(
+                    f"[probe] patience exhausted after {probe_no_improve_count} epochs, "
+                    f"stopping pretrain. best_mIoU={best_probe_miou:.2f}%"
+                )
+                writer.close()
+                logger.info(f"done. outputs: {exp_dir}")
+                return
 
         if args.dry_run:
             break

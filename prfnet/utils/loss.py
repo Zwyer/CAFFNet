@@ -219,17 +219,19 @@ class NOMAEPCPLoss(nn.Module):
     Aggregate loss for NOMAE + PCP pretraining.
 
     L = lambda_occ_rv * L_occ_rv + lambda_occ_pb * L_occ_pb +
-        lambda_pcp_rv * L_pcp_rv + lambda_pcp_pb * L_pcp_pb
+        lambda_pcp_rv * L_pcp_rv + lambda_pcp_pb * L_pcp_pb +
+        lambda_cv * L_cv  (optional cross-view consistency)
     """
 
     def __init__(
         self,
         lambda_occ: float = 1.0,
         lambda_pcp: float = 0.5,
-        lambda_occ_rv: float | None = None,
-        lambda_occ_pb: float | None = None,
-        lambda_pcp_rv: float | None = None,
-        lambda_pcp_pb: float | None = None,
+        lambda_occ_rv: Optional[float] = None,
+        lambda_occ_pb: Optional[float] = None,
+        lambda_pcp_rv: Optional[float] = None,
+        lambda_pcp_pb: Optional[float] = None,
+        lambda_cv: float = 0.0,
     ):
         super().__init__()
         occ = float(lambda_occ)
@@ -238,6 +240,7 @@ class NOMAEPCPLoss(nn.Module):
         self.lambda_occ_pb = float(occ if lambda_occ_pb is None else lambda_occ_pb)
         self.lambda_pcp_rv = float(pcp if lambda_pcp_rv is None else lambda_pcp_rv)
         self.lambda_pcp_pb = float(pcp if lambda_pcp_pb is None else lambda_pcp_pb)
+        self.lambda_cv = float(max(0.0, lambda_cv))
 
     def forward(self, outputs: dict) -> dict:
         l_occ_rv = outputs["loss_occ_rv"]
@@ -252,7 +255,10 @@ class NOMAEPCPLoss(nn.Module):
             + self.lambda_pcp_rv * l_pcp_rv
             + self.lambda_pcp_pb * l_pcp_pb
         )
-        return {
+        l_cv = outputs.get("loss_cv", None)
+        if l_cv is not None and self.lambda_cv > 0.0:
+            total = total + self.lambda_cv * l_cv
+        ret = {
             "total": total,
             "occ": l_occ.detach(),
             "pcp": l_pcp.detach(),
@@ -261,3 +267,6 @@ class NOMAEPCPLoss(nn.Module):
             "pcp_rv": l_pcp_rv.detach(),
             "pcp_pb": l_pcp_pb.detach(),
         }
+        if l_cv is not None:
+            ret["cv"] = l_cv.detach()
+        return ret
