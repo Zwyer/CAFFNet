@@ -233,6 +233,10 @@ class NOMAEPCPPretrainHead(nn.Module):
         occ_pos_weight_adaptive: bool = False,
         occ_pos_weight_min: float = 1.0,
         occ_pos_weight_max: float = 12.0,
+        occ_pos_weight_ema_decay: float = 0.95,
+        pcp_pos_weight: float = 1.0,
+        pcp_near_range_max: float = 0.5,
+        pcp_near_weight: float = 1.5,
     ):
         super().__init__()
         hidden = max(in_c // 2, 32)
@@ -244,6 +248,11 @@ class NOMAEPCPPretrainHead(nn.Module):
         self.occ_pos_weight_adaptive = bool(occ_pos_weight_adaptive)
         self.occ_pos_weight_min = float(max(1e-6, occ_pos_weight_min))
         self.occ_pos_weight_max = float(max(self.occ_pos_weight_min, occ_pos_weight_max))
+        self.occ_pos_weight_ema_decay = float(max(0.0, min(0.9999, occ_pos_weight_ema_decay)))
+        self.pcp_pos_weight = float(max(1e-6, pcp_pos_weight))
+        self.pcp_near_range_max = float(max(1e-6, pcp_near_range_max))
+        self.pcp_near_weight = float(max(1.0, pcp_near_weight))
+        self.register_buffer("_occ_pw_ema", torch.tensor(float(self.occ_pos_weight), dtype=torch.float32))
 
         self.occ_head = nn.Sequential(
             nn.Conv2d(in_c, hidden, 1, bias=False),
@@ -306,6 +315,14 @@ class NOMAEPCPPretrainHead(nn.Module):
                     pos = (target_occ_ms[eff] > 0.5).float().mean().item()
                     pos = max(1e-4, min(1.0 - 1e-4, float(pos)))
                     pw_val = (1.0 - pos) / pos
+                # EMA smooth to reduce batch jitter.
+                pw_new = max(self.occ_pos_weight_min, min(self.occ_pos_weight_max, float(pw_val)))
+                pw_ema = (
+                    self.occ_pos_weight_ema_decay * float(self._occ_pw_ema.item())
+                    + (1.0 - self.occ_pos_weight_ema_decay) * pw_new
+                )
+                self._occ_pw_ema.fill_(float(pw_ema))
+                pw_val = float(self._occ_pw_ema.item())
             pw_val = max(self.occ_pos_weight_min, min(self.occ_pos_weight_max, float(pw_val)))
             pw = pred_occ.new_tensor(pw_val)
             loss_map = F.binary_cross_entropy_with_logits(
@@ -364,8 +381,18 @@ class NOMAEPCPPretrainHead(nn.Module):
                 pcp_sup_mask = mask
         else:
             pcp_sup_mask = mask
-        denom = pcp_sup_mask.sum().clamp(min=1.0)
-        loss_pcp = (center_loss_map * pcp_sup_mask).sum() / denom
+
+        # Geometry-aware weighting:
+        # - occupied cells get stronger supervision (pcp_pos_weight)
+        # - near-range cells (small normalized range in target_center[...,0]) get extra emphasis
+        pcp_weight = torch.ones_like(pcp_sup_mask)
+        pcp_weight = pcp_weight + (target_occ > 0.5).float() * (self.pcp_pos_weight - 1.0)
+        near = (target_center[:, 0:1].abs() <= self.pcp_near_range_max).float()
+        pcp_weight = pcp_weight + near * (self.pcp_near_weight - 1.0)
+        eff_weight = pcp_sup_mask * pcp_weight
+
+        denom = eff_weight.sum().clamp(min=1.0)
+        loss_pcp = (center_loss_map * eff_weight).sum() / denom
 
         masked_total = mask.sum().clamp(min=1.0)
         masked_pos_ratio = ((target_occ > 0.5).float() * mask).sum() / masked_total

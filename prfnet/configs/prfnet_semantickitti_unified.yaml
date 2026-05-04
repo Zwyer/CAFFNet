@@ -139,6 +139,10 @@ pretrain:
   # 预训练损失权重
   lambda_occ: 1.0
   lambda_pcp: 1.2          # PCP 权重略升，强化几何重建语义
+  lambda_occ_rv: 1.0
+  lambda_occ_pb: 1.0
+  lambda_pcp_rv: 1.2
+  lambda_pcp_pb: 1.0
   log_interval: 20
 
   # -------- Phase A: mask curriculum + 早停 --------
@@ -150,7 +154,11 @@ pretrain:
   pb_mask_ratio_end: 0.93
 
   early_stop_enable: true
+  early_stop_mode: relative   # relative | absolute
   early_stop_window: 200
+  early_stop_min_steps: 2000
+  early_stop_rel_tol: 1.0e-3
+  early_stop_rel_window: 200
   early_stop_occ_thr: 1.0e-3
   early_stop_pcp_thr: 1.0e-3
   early_stop_gnorm_thr: 0.05
@@ -170,7 +178,11 @@ pretrain:
   occ_pos_weight_adaptive: true
   occ_pos_weight_min: 1.5
   occ_pos_weight_max: 12.0
+  occ_pos_weight_ema_decay: 0.95
   occ_focal_gamma: 2.0
+  pcp_pos_weight: 1.2
+  pcp_near_range_max: 0.35
+  pcp_near_weight: 1.6
 
   # -------- Phase E: 结构化 mask（泛化增强） --------
   mask_strategy: mixed      # random | block | band | mixed
@@ -196,6 +208,8 @@ pretrain:
   probe_eval_steps: 20
   probe_lr: 1.0e-2
   probe_weight_decay: 0.0
+  probe_batch_size: 4
+  probe_num_workers: 8
 
 # Pretraining-specific data/model overrides (optional)
 pretrain_data:

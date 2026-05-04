@@ -200,10 +200,14 @@ class PRFNet(nn.Module):
         occ_pos_weight_adaptive: bool = False,
         occ_pos_weight_min: float = 1.0,
         occ_pos_weight_max: float = 12.0,
+        occ_pos_weight_ema_decay: float = 0.95,
         occ_focal_gamma: float = 2.0,
         pcp_stopgrad_replace: bool = True,
         informative_occ_only: bool = True,
         pcp_informative_only: bool = True,
+        pcp_pos_weight: float = 1.0,
+        pcp_near_range_max: float = 0.5,
+        pcp_near_weight: float = 1.5,
     ) -> Dict[str, torch.Tensor]:
         """
         Self-supervised pretraining forward.
@@ -293,10 +297,18 @@ class PRFNet(nn.Module):
         self.pretrain_head_pb.occ_pos_weight_min = float(max(1e-6, occ_pos_weight_min))
         self.pretrain_head_rv.occ_pos_weight_max = float(max(1e-6, occ_pos_weight_max))
         self.pretrain_head_pb.occ_pos_weight_max = float(max(1e-6, occ_pos_weight_max))
+        self.pretrain_head_rv.occ_pos_weight_ema_decay = float(max(0.0, min(0.9999, occ_pos_weight_ema_decay)))
+        self.pretrain_head_pb.occ_pos_weight_ema_decay = float(max(0.0, min(0.9999, occ_pos_weight_ema_decay)))
         self.pretrain_head_rv.occ_focal_gamma = float(max(0.0, occ_focal_gamma))
         self.pretrain_head_pb.occ_focal_gamma = float(max(0.0, occ_focal_gamma))
         self.pretrain_head_rv.pcp_stopgrad_replace = bool(pcp_stopgrad_replace)
         self.pretrain_head_pb.pcp_stopgrad_replace = bool(pcp_stopgrad_replace)
+        self.pretrain_head_rv.pcp_pos_weight = float(max(1e-6, pcp_pos_weight))
+        self.pretrain_head_pb.pcp_pos_weight = float(max(1e-6, pcp_pos_weight))
+        self.pretrain_head_rv.pcp_near_range_max = float(max(1e-6, pcp_near_range_max))
+        self.pretrain_head_pb.pcp_near_range_max = float(max(1e-6, pcp_near_range_max))
+        self.pretrain_head_rv.pcp_near_weight = float(max(1.0, pcp_near_weight))
+        self.pretrain_head_pb.pcp_near_weight = float(max(1.0, pcp_near_weight))
 
         rv_ret = self.pretrain_head_rv(
             rv_out, rv_mask, rv_occ_tgt, rv_center_tgt,

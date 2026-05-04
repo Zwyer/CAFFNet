@@ -82,7 +82,8 @@ def _ma(values: deque) -> float:
 
 def run_linear_probe_eval(
     model: PRFNet,
-    loader: DataLoader,
+    train_loader: DataLoader,
+    eval_loader: DataLoader,
     device: torch.device,
     num_classes: int = 19,
     ignore_index: int = 255,
@@ -103,7 +104,7 @@ def run_linear_probe_eval(
     train_iters = 0
     eval_cm = np.zeros((num_classes, num_classes), dtype=np.int64)
 
-    for batch in loader:
+    for batch in train_loader:
         rv_img = batch["rv_img"].to(device, non_blocking=True)
         pb_img = batch["pb_img"].to(device, non_blocking=True)
         rv_coords = batch["rv_coords"].to(device, non_blocking=True)
@@ -123,18 +124,39 @@ def run_linear_probe_eval(
             probe_head = nn.Linear(D, num_classes).to(device)
             opt = torch.optim.AdamW(probe_head.parameters(), lr=lr, weight_decay=weight_decay)
 
-        if train_iters < train_steps:
-            probe_head.train()
-            logits = probe_head(feat_flat[valid])
-            loss = nn.functional.cross_entropy(logits, labels_flat[valid])
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            opt.step()
-            train_iters += 1
-            continue
+        if train_iters >= train_steps:
+            break
+        probe_head.train()
+        logits = probe_head(feat_flat[valid])
+        loss = nn.functional.cross_entropy(logits, labels_flat[valid])
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        train_iters += 1
 
+    if probe_head is None:
+        if was_training:
+            model.train()
+        return 0.0
+
+    for batch in eval_loader:
         if eval_steps <= 0:
             break
+        rv_img = batch["rv_img"].to(device, non_blocking=True)
+        pb_img = batch["pb_img"].to(device, non_blocking=True)
+        rv_coords = batch["rv_coords"].to(device, non_blocking=True)
+        pb_coords = batch["pb_coords"].to(device, non_blocking=True)
+        points = batch["points"].to(device, non_blocking=True)
+        labels = batch["labels"].to(device, non_blocking=True)
+
+        feat = model.extract_pretrain_point_features(rv_img, pb_img, rv_coords, pb_coords, points)
+        B, N, _ = feat.shape
+        feat_flat = feat.reshape(B * N, -1)
+        labels_flat = labels.reshape(B * N)
+        valid = labels_flat != ignore_index
+        if valid.sum().item() <= 0:
+            continue
+
         probe_head.eval()
         logits = probe_head(feat_flat)
         preds = logits.argmax(dim=-1)
@@ -143,18 +165,56 @@ def run_linear_probe_eval(
         idx = g * num_classes + p
         eval_cm += np.bincount(idx, minlength=num_classes * num_classes).reshape(num_classes, num_classes)
         eval_steps -= 1
-        if eval_steps == 0:
-            break
 
     if was_training:
         model.train()
-    if probe_head is None:
-        return 0.0
     inter = np.diag(eval_cm).astype(np.float64)
     union = eval_cm.sum(axis=1) + eval_cm.sum(axis=0) - np.diag(eval_cm)
     valid_cls = union > 0
     iou = np.where(valid_cls, inter / (union + 1e-10), np.nan)
     return float(np.nanmean(iou) * 100.0) if np.any(valid_cls) else 0.0
+
+
+def build_probe_loader(
+    cfg_data: dict,
+    split: str,
+    batch_size: int,
+    num_workers: int,
+) -> DataLoader:
+    ds = SemanticKITTIDataset(
+        root=cfg_data["root"],
+        split=split,
+        rv_H=cfg_data["rv_H"],
+        rv_W=cfg_data["rv_W"],
+        pb_H=cfg_data["pb_H"],
+        pb_W=cfg_data["pb_W"],
+        augment=(split == "train"),
+        rotate=cfg_data.get("rotate", True),
+        flip=cfg_data.get("flip", True),
+        scale_min=cfg_data.get("scale_min", 0.95),
+        scale_max=cfg_data.get("scale_max", 1.05),
+        drop_p=cfg_data.get("drop_p", 0.05),
+        R_max=cfg_data.get("R_max", 80.0),
+        use_polarmix=(cfg_data.get("use_polarmix", False) if split == "train" else False),
+        use_lasermix=(cfg_data.get("use_lasermix", False) if split == "train" else False),
+        fov_up=cfg_data["fov_up"],
+        fov_down=cfg_data["fov_down"],
+        max_points=cfg_data.get("max_points", 131072),
+        polarmix_p=cfg_data.get("polarmix_p", 0.0),
+        polarmix_sectors=cfg_data.get("polarmix_sectors", 8),
+        lasermix_p=cfg_data.get("lasermix_p", 0.0),
+        use_surface_normals=cfg_data.get("use_surface_normals", False),
+        use_angle_encoding=cfg_data.get("use_angle_encoding", False),
+    )
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        num_workers=num_workers,
+        collate_fn=collate_fn,
+        pin_memory=True,
+        drop_last=(split == "train"),
+    )
 
 
 def build_model(cfg: dict, device: torch.device) -> PRFNet:
@@ -275,7 +335,12 @@ def main() -> None:
 
     model = build_model(cfg_for_model, device)
     criterion = NOMAEPCPLoss(
-        lambda_occ=pc.get("lambda_occ", 1.0), lambda_pcp=pc.get("lambda_pcp", 0.5)
+        lambda_occ=pc.get("lambda_occ", 1.0),
+        lambda_pcp=pc.get("lambda_pcp", 0.5),
+        lambda_occ_rv=pc.get("lambda_occ_rv", None),
+        lambda_occ_pb=pc.get("lambda_occ_pb", None),
+        lambda_pcp_rv=pc.get("lambda_pcp_rv", None),
+        lambda_pcp_pb=pc.get("lambda_pcp_pb", None),
     )
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -335,15 +400,20 @@ def main() -> None:
     occ_pos_weight_max = float(pc.get("occ_pos_weight_max", 12.0))
 
     early_stop_enable = bool(pc.get("early_stop_enable", False))
+    early_stop_mode = str(pc.get("early_stop_mode", "relative")).lower()
     early_stop_window = int(pc.get("early_stop_window", 200))
     early_stop_occ_thr = float(pc.get("early_stop_occ_thr", 1.0e-3))
     early_stop_pcp_thr = float(pc.get("early_stop_pcp_thr", 1.0e-3))
     early_stop_gnorm_thr = float(pc.get("early_stop_gnorm_thr", 0.05))
     early_stop_patience_steps = int(pc.get("early_stop_patience_steps", 600))
+    early_stop_min_steps = int(pc.get("early_stop_min_steps", 2000))
+    early_stop_rel_tol = float(pc.get("early_stop_rel_tol", 1.0e-3))
+    early_stop_rel_window = int(pc.get("early_stop_rel_window", 200))
     early_stop_counter = 0
     ma_occ = deque(maxlen=max(1, early_stop_window))
     ma_pcp = deque(maxlen=max(1, early_stop_window))
     ma_gn = deque(maxlen=max(1, early_stop_window))
+    occ_rel_hist = deque(maxlen=max(2, early_stop_rel_window + 1))
 
     logger.info(
         f"Pretrain knobs: input_masking={input_masking_enable}/{input_masking_mode}, "
@@ -359,9 +429,8 @@ def main() -> None:
         )
     if early_stop_enable:
         logger.info(
-            f"Early-stop enabled: window={early_stop_window}, occ<{early_stop_occ_thr}, "
-            f"pcp<{early_stop_pcp_thr}, gnorm<{early_stop_gnorm_thr}, "
-            f"patience={early_stop_patience_steps} steps"
+            f"Early-stop enabled: mode={early_stop_mode}, "
+            f"window={early_stop_window}, patience={early_stop_patience_steps} steps"
         )
 
     log_interval = int(pc.get("log_interval", 20))
@@ -373,7 +442,19 @@ def main() -> None:
     probe_eval_steps = int(pc.get("probe_eval_steps", 20))
     probe_lr = float(pc.get("probe_lr", 1.0e-2))
     probe_weight_decay = float(pc.get("probe_weight_decay", 0.0))
+    probe_batch_size = int(pc.get("probe_batch_size", dc.get("batch_size", 2)))
+    probe_num_workers = int(pc.get("probe_num_workers", dc.get("num_workers", 8)))
     best_probe_miou = -1.0
+
+    probe_train_loader = None
+    probe_eval_loader = None
+    if probe_eval_enable and loader is not None and not args.dry_run:
+        probe_train_loader = build_probe_loader(
+            dc, split="train", batch_size=probe_batch_size, num_workers=probe_num_workers
+        )
+        probe_eval_loader = build_probe_loader(
+            dc, split="val", batch_size=probe_batch_size, num_workers=probe_num_workers
+        )
 
     global_step = 0
     overflow_steps = 0
@@ -454,10 +535,14 @@ def main() -> None:
                     occ_pos_weight_adaptive=occ_pos_weight_adaptive,
                     occ_pos_weight_min=occ_pos_weight_min,
                     occ_pos_weight_max=occ_pos_weight_max,
+                    occ_pos_weight_ema_decay=float(pc.get("occ_pos_weight_ema_decay", 0.95)),
                     occ_focal_gamma=occ_focal_gamma,
                     pcp_stopgrad_replace=pcp_stopgrad_replace,
                     informative_occ_only=informative_occ_only,
                     pcp_informative_only=pcp_informative_only,
+                    pcp_pos_weight=float(pc.get("pcp_pos_weight", 1.0)),
+                    pcp_near_range_max=float(pc.get("pcp_near_range_max", 0.5)),
+                    pcp_near_weight=float(pc.get("pcp_near_weight", 1.5)),
                 )
                 loss_dict = criterion(outputs)
                 loss = loss_dict["total"]
@@ -516,12 +601,29 @@ def main() -> None:
             occ_ma = _ma(ma_occ)
             pcp_ma = _ma(ma_pcp)
             gn_ma = _ma(ma_gn) if len(ma_gn) > 0 else float("inf")
+            occ_rel_hist.append(occ_ma)
 
             if early_stop_enable and len(ma_occ) >= max(1, early_stop_window):
-                if occ_ma < early_stop_occ_thr and pcp_ma < early_stop_pcp_thr and gn_ma < early_stop_gnorm_thr:
-                    early_stop_counter += 1
-                else:
+                if global_step < max(0, early_stop_min_steps):
                     early_stop_counter = 0
+                else:
+                    if early_stop_mode == "absolute":
+                        cond = (
+                            occ_ma < early_stop_occ_thr
+                            and pcp_ma < early_stop_pcp_thr
+                            and gn_ma < early_stop_gnorm_thr
+                        )
+                    else:
+                        cond = False
+                        if len(occ_rel_hist) >= occ_rel_hist.maxlen:
+                            old = occ_rel_hist[0]
+                            new = occ_rel_hist[-1]
+                            rel_improve = (old - new) / max(abs(old), 1e-8)
+                            cond = (rel_improve < early_stop_rel_tol) and (gn_ma < early_stop_gnorm_thr)
+                    if cond:
+                        early_stop_counter += 1
+                    else:
+                        early_stop_counter = 0
             else:
                 early_stop_counter = 0
 
@@ -529,6 +631,14 @@ def main() -> None:
             writer.add_scalar("pretrain/loss_step", ep_total / step, global_step)
             writer.add_scalar("pretrain/occ_step", loss_dict["occ"], global_step)
             writer.add_scalar("pretrain/pcp_step", loss_dict["pcp"], global_step)
+            if "occ_rv" in loss_dict:
+                writer.add_scalar("pretrain/occ_rv_step", loss_dict["occ_rv"], global_step)
+            if "occ_pb" in loss_dict:
+                writer.add_scalar("pretrain/occ_pb_step", loss_dict["occ_pb"], global_step)
+            if "pcp_rv" in loss_dict:
+                writer.add_scalar("pretrain/pcp_rv_step", loss_dict["pcp_rv"], global_step)
+            if "pcp_pb" in loss_dict:
+                writer.add_scalar("pretrain/pcp_pb_step", loss_dict["pcp_pb"], global_step)
             writer.add_scalar("pretrain/lr", lr, global_step)
             writer.add_scalar("pretrain/rv_mask_ratio_step", outputs["rv_mask_ratio"], global_step)
             writer.add_scalar("pretrain/pb_mask_ratio_step", outputs["pb_mask_ratio"], global_step)
@@ -636,13 +746,15 @@ def main() -> None:
 
         if (
             probe_eval_enable
-            and loader is not None
+            and probe_train_loader is not None
+            and probe_eval_loader is not None
             and (epoch % max(1, probe_eval_every) == 0)
             and not args.dry_run
         ):
             probe_miou = run_linear_probe_eval(
                 model=model,
-                loader=loader,
+                train_loader=probe_train_loader,
+                eval_loader=probe_eval_loader,
                 device=device,
                 num_classes=19,
                 ignore_index=255,

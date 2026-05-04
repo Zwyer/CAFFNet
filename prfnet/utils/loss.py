@@ -218,21 +218,46 @@ class NOMAEPCPLoss(nn.Module):
     """
     Aggregate loss for NOMAE + PCP pretraining.
 
-    L = lambda_occ * (L_occ_rv + L_occ_pb) +
-        lambda_pcp * (L_pcp_rv + L_pcp_pb)
+    L = lambda_occ_rv * L_occ_rv + lambda_occ_pb * L_occ_pb +
+        lambda_pcp_rv * L_pcp_rv + lambda_pcp_pb * L_pcp_pb
     """
 
-    def __init__(self, lambda_occ: float = 1.0, lambda_pcp: float = 0.5):
+    def __init__(
+        self,
+        lambda_occ: float = 1.0,
+        lambda_pcp: float = 0.5,
+        lambda_occ_rv: float | None = None,
+        lambda_occ_pb: float | None = None,
+        lambda_pcp_rv: float | None = None,
+        lambda_pcp_pb: float | None = None,
+    ):
         super().__init__()
-        self.lambda_occ = float(lambda_occ)
-        self.lambda_pcp = float(lambda_pcp)
+        occ = float(lambda_occ)
+        pcp = float(lambda_pcp)
+        self.lambda_occ_rv = float(occ if lambda_occ_rv is None else lambda_occ_rv)
+        self.lambda_occ_pb = float(occ if lambda_occ_pb is None else lambda_occ_pb)
+        self.lambda_pcp_rv = float(pcp if lambda_pcp_rv is None else lambda_pcp_rv)
+        self.lambda_pcp_pb = float(pcp if lambda_pcp_pb is None else lambda_pcp_pb)
 
     def forward(self, outputs: dict) -> dict:
-        l_occ = outputs["loss_occ_rv"] + outputs["loss_occ_pb"]
-        l_pcp = outputs["loss_pcp_rv"] + outputs["loss_pcp_pb"]
-        total = self.lambda_occ * l_occ + self.lambda_pcp * l_pcp
+        l_occ_rv = outputs["loss_occ_rv"]
+        l_occ_pb = outputs["loss_occ_pb"]
+        l_pcp_rv = outputs["loss_pcp_rv"]
+        l_pcp_pb = outputs["loss_pcp_pb"]
+        l_occ = l_occ_rv + l_occ_pb
+        l_pcp = l_pcp_rv + l_pcp_pb
+        total = (
+            self.lambda_occ_rv * l_occ_rv
+            + self.lambda_occ_pb * l_occ_pb
+            + self.lambda_pcp_rv * l_pcp_rv
+            + self.lambda_pcp_pb * l_pcp_pb
+        )
         return {
             "total": total,
             "occ": l_occ.detach(),
             "pcp": l_pcp.detach(),
+            "occ_rv": l_occ_rv.detach(),
+            "occ_pb": l_occ_pb.detach(),
+            "pcp_rv": l_pcp_rv.detach(),
+            "pcp_pb": l_pcp_pb.detach(),
         }
