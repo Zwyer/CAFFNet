@@ -109,7 +109,7 @@ loss:
     - 8.00
 
 eval:
-  use_knn: true   # 验证阶段更贴近最终效果（通常+1~2 mIoU）
+  use_knn: false   # 验证阶段更贴近最终效果（通常+1~2 mIoU）
   knn_radius: 1
   knn_dual: false
 

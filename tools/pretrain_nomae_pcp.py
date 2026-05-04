@@ -19,6 +19,7 @@ from typing import Tuple
 import math
 import numpy as np
 import torch
+import torch.nn as nn
 import yaml
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -77,6 +78,84 @@ def _ma(values: deque) -> float:
     if len(values) == 0:
         return 0.0
     return float(sum(values) / float(len(values)))
+
+
+@torch.no_grad()
+def run_linear_probe_eval(
+    model: PRFNet,
+    loader: DataLoader,
+    device: torch.device,
+    num_classes: int = 19,
+    ignore_index: int = 255,
+    train_steps: int = 80,
+    eval_steps: int = 20,
+    lr: float = 1.0e-2,
+    weight_decay: float = 0.0,
+) -> float:
+    """
+    Lightweight proxy evaluation for pretraining quality:
+    freeze backbone features, train a linear head shortly, report mIoU.
+    """
+    was_training = model.training
+    model.eval()
+
+    probe_head = None
+    opt = None
+    train_iters = 0
+    eval_cm = np.zeros((num_classes, num_classes), dtype=np.int64)
+
+    for batch in loader:
+        rv_img = batch["rv_img"].to(device, non_blocking=True)
+        pb_img = batch["pb_img"].to(device, non_blocking=True)
+        rv_coords = batch["rv_coords"].to(device, non_blocking=True)
+        pb_coords = batch["pb_coords"].to(device, non_blocking=True)
+        points = batch["points"].to(device, non_blocking=True)
+        labels = batch["labels"].to(device, non_blocking=True)
+
+        feat = model.extract_pretrain_point_features(rv_img, pb_img, rv_coords, pb_coords, points)
+        B, N, D = feat.shape
+        feat_flat = feat.reshape(B * N, D)
+        labels_flat = labels.reshape(B * N)
+        valid = labels_flat != ignore_index
+        if valid.sum().item() <= 0:
+            continue
+
+        if probe_head is None:
+            probe_head = nn.Linear(D, num_classes).to(device)
+            opt = torch.optim.AdamW(probe_head.parameters(), lr=lr, weight_decay=weight_decay)
+
+        if train_iters < train_steps:
+            probe_head.train()
+            logits = probe_head(feat_flat[valid])
+            loss = nn.functional.cross_entropy(logits, labels_flat[valid])
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            train_iters += 1
+            continue
+
+        if eval_steps <= 0:
+            break
+        probe_head.eval()
+        logits = probe_head(feat_flat)
+        preds = logits.argmax(dim=-1)
+        p = preds[valid].detach().cpu().numpy().astype(np.int64)
+        g = labels_flat[valid].detach().cpu().numpy().astype(np.int64)
+        idx = g * num_classes + p
+        eval_cm += np.bincount(idx, minlength=num_classes * num_classes).reshape(num_classes, num_classes)
+        eval_steps -= 1
+        if eval_steps == 0:
+            break
+
+    if was_training:
+        model.train()
+    if probe_head is None:
+        return 0.0
+    inter = np.diag(eval_cm).astype(np.float64)
+    union = eval_cm.sum(axis=1) + eval_cm.sum(axis=0) - np.diag(eval_cm)
+    valid_cls = union > 0
+    iou = np.where(valid_cls, inter / (union + 1e-10), np.nan)
+    return float(np.nanmean(iou) * 100.0) if np.any(valid_cls) else 0.0
 
 
 def build_model(cfg: dict, device: torch.device) -> PRFNet:
@@ -241,6 +320,20 @@ def main() -> None:
     mask_pos_ratio_min = float(pc.get("mask_pos_ratio_min", 0.08))
     mask_pos_ratio_max = float(pc.get("mask_pos_ratio_max", 0.50))
     mask_resample_max_tries = int(pc.get("mask_resample_max_tries", 5))
+    mask_strategy = str(pc.get("mask_strategy", "mixed"))
+    rv_band_axis = str(pc.get("rv_band_axis", "row"))
+    pb_band_axis = str(pc.get("pb_band_axis", "col"))
+    mask_mix_random = float(pc.get("mask_mix_random", 0.5))
+    mask_mix_block = float(pc.get("mask_mix_block", 0.3))
+    mask_mix_band = float(pc.get("mask_mix_band", 0.2))
+    block_h_min = int(pc.get("block_h_min", 4))
+    block_h_max = int(pc.get("block_h_max", 16))
+    block_w_min = int(pc.get("block_w_min", 16))
+    block_w_max = int(pc.get("block_w_max", 64))
+    pcp_informative_only = bool(pc.get("pcp_informative_only", True))
+    occ_pos_weight_adaptive = bool(pc.get("occ_pos_weight_adaptive", False))
+    occ_pos_weight_min = float(pc.get("occ_pos_weight_min", 1.0))
+    occ_pos_weight_max = float(pc.get("occ_pos_weight_max", 12.0))
 
     early_stop_enable = bool(pc.get("early_stop_enable", False))
     early_stop_window = int(pc.get("early_stop_window", 200))
@@ -256,6 +349,7 @@ def main() -> None:
     logger.info(
         f"Pretrain knobs: input_masking={input_masking_enable}/{input_masking_mode}, "
         f"occ_loss={occ_loss_type}, occ_scales={occ_scales}, "
+        f"mask_strategy={mask_strategy}, "
         f"pos_ratio_control={mask_pos_ratio_control_enable}"
     )
     if mask_curriculum_enable:
@@ -274,6 +368,13 @@ def main() -> None:
     log_interval = int(pc.get("log_interval", 20))
     grad_clip = float(pc.get("grad_clip", 10.0))
     epochs = int(pc.get("epochs", 10))
+    probe_eval_enable = bool(pc.get("probe_eval_enable", False))
+    probe_eval_every = int(pc.get("probe_eval_every", 1))
+    probe_train_steps = int(pc.get("probe_train_steps", 80))
+    probe_eval_steps = int(pc.get("probe_eval_steps", 20))
+    probe_lr = float(pc.get("probe_lr", 1.0e-2))
+    probe_weight_decay = float(pc.get("probe_weight_decay", 0.0))
+    best_probe_miou = -1.0
 
     global_step = 0
     overflow_steps = 0
@@ -334,6 +435,16 @@ def main() -> None:
                     pb_mask_ratio=cur_pb_mask_ratio,
                     input_masking_enable=input_masking_enable,
                     input_masking_mode=input_masking_mode,
+                    mask_strategy=mask_strategy,
+                    rv_band_axis=rv_band_axis,
+                    pb_band_axis=pb_band_axis,
+                    mask_mix_random=mask_mix_random,
+                    mask_mix_block=mask_mix_block,
+                    mask_mix_band=mask_mix_band,
+                    block_h_min=block_h_min,
+                    block_h_max=block_h_max,
+                    block_w_min=block_w_min,
+                    block_w_max=block_w_max,
                     mask_pos_ratio_control_enable=mask_pos_ratio_control_enable,
                     mask_pos_ratio_min=mask_pos_ratio_min,
                     mask_pos_ratio_max=mask_pos_ratio_max,
@@ -341,9 +452,13 @@ def main() -> None:
                     occ_scales=occ_scales,
                     occ_loss_type=occ_loss_type,
                     occ_pos_weight=occ_pos_weight,
+                    occ_pos_weight_adaptive=occ_pos_weight_adaptive,
+                    occ_pos_weight_min=occ_pos_weight_min,
+                    occ_pos_weight_max=occ_pos_weight_max,
                     occ_focal_gamma=occ_focal_gamma,
                     pcp_stopgrad_replace=pcp_stopgrad_replace,
                     informative_occ_only=informative_occ_only,
+                    pcp_informative_only=pcp_informative_only,
                 )
                 loss_dict = criterion(outputs)
                 loss = loss_dict["total"]
@@ -519,6 +634,30 @@ def main() -> None:
         torch.save(ckpt, os.path.join(ckpt_dir, "latest.pth"))
         if not args.dry_run:
             torch.save(ckpt, os.path.join(ckpt_dir, f"epoch{epoch:03d}.pth"))
+
+        if (
+            probe_eval_enable
+            and loader is not None
+            and (epoch % max(1, probe_eval_every) == 0)
+            and not args.dry_run
+        ):
+            probe_miou = run_linear_probe_eval(
+                model=model,
+                loader=loader,
+                device=device,
+                num_classes=19,
+                ignore_index=255,
+                train_steps=probe_train_steps,
+                eval_steps=probe_eval_steps,
+                lr=probe_lr,
+                weight_decay=probe_weight_decay,
+            )
+            writer.add_scalar("probe/miou", probe_miou, epoch)
+            logger.info(f"[probe] epoch={epoch:03d} proxy_mIoU={probe_miou:.2f}%")
+            if probe_miou > best_probe_miou:
+                best_probe_miou = probe_miou
+                torch.save(ckpt, os.path.join(ckpt_dir, "best_pretrain.pth"))
+                logger.info(f"[probe] new best_pretrain saved: proxy_mIoU={probe_miou:.2f}%")
 
         if args.dry_run:
             break
