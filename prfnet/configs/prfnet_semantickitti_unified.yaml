@@ -67,13 +67,13 @@ model:
   rv_in: 12
 
 train:
-  epochs: 50
+  epochs: 150
   seed: 42
   optimizer: adamw
-  lr: 1.0e-3
+  lr: 3.0e-4
   weight_decay: 1.0e-4
   grad_clip: 10.0
-  scheduler: onecycle
+  scheduler: cosine
   pct_start: 0.10
   eta_min: 1.0e-6
   amp: true
@@ -124,7 +124,7 @@ pretrain:
   # 训练轮次与优化器
   epochs: 20
   seed: 42
-  lr: 8.0e-4
+  lr: 4.0e-4
   weight_decay: 1.0e-4
   grad_clip: 10.0
   amp: true
@@ -229,7 +229,7 @@ pretrain:
 
 # Pretraining-specific data/model overrides (optional)
 pretrain_data:
-  batch_size: 4
+  batch_size: 2
   num_workers: 20
   augment: true
   use_polarmix: false
