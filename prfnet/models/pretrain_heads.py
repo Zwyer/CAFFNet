@@ -329,6 +329,8 @@ class NOMAEPCPPretrainHead(nn.Module):
         pcp_pos_weight: float = 1.0,
         pcp_near_range_max: float = 10.0,  # Euclidean distance (m) threshold for near-range
         pcp_near_weight: float = 1.5,
+        pcp_residual_center: bool = True,  # predict delta from visible-cell mean (removes position shortcut)
+        pcp_far_only: bool = False,         # only supervise cells far from visible occupied cells
     ):
         super().__init__()
         hidden = max(in_c // 2, 32)
@@ -344,6 +346,8 @@ class NOMAEPCPPretrainHead(nn.Module):
         self.pcp_pos_weight = float(max(1e-6, pcp_pos_weight))
         self.pcp_near_range_max = float(max(1e-6, pcp_near_range_max))
         self.pcp_near_weight = float(max(1.0, pcp_near_weight))
+        self.pcp_residual_center = bool(pcp_residual_center)
+        self.pcp_far_only = bool(pcp_far_only)
         self.register_buffer("_occ_pw_ema", torch.tensor(float(self.occ_pos_weight), dtype=torch.float32))
 
         self.occ_head = nn.Sequential(
@@ -453,6 +457,8 @@ class NOMAEPCPPretrainHead(nn.Module):
         informative_only: bool = True,
         pcp_informative_only: bool = True,
         neighbor_sup_only_visible: bool = True,
+        pcp_residual_center: bool = True,
+        pcp_far_only: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
         Args:
@@ -460,22 +466,28 @@ class NOMAEPCPPretrainHead(nn.Module):
           mask:          (B,1,H,W), 1 means masked
           target_occ:    (B,1,H,W), occupancy target in {0,1}
           target_center: (B,3,H,W), xyz target center (meters)
-          neighbor_sup_only_visible: if True (NOMAE-style), only supervise masked cells
-              that are in the neighborhood of VISIBLE (non-masked) occupied cells.
-              If False, use original behaviour (any occupied neighbor, including masked).
+          neighbor_sup_only_visible: only supervise OCC in VISIBLE occupied cell neighborhoods.
+          pcp_residual_center: predict delta from visible-cell mean XYZ (removes grid-pos shortcut).
+          pcp_far_only: only supervise PCP for cells with no visible occupied neighbor (hard cases).
         """
         pred_occ = self.occ_head(feat)          # (B,S,H,W)
         occ_tgt_ms = self._build_occ_targets(target_occ)
 
+        # Visible occupied cells — shared by OCC supervision and PCP tasks
+        vis_occ = target_occ * (1.0 - mask)    # (B,1,H,W): occupied AND not masked
+
+        # Compute visible neighborhood once; reused for OCC + PCP far-only filter
+        need_vis_nbhd = (informative_only and neighbor_sup_only_visible) or pcp_far_only
+        visible_nbhd_max = None
+        if need_vis_nbhd:
+            visible_nbhd = self._build_visible_neighborhood(vis_occ)        # (B,S,H,W)
+            visible_nbhd_max = visible_nbhd.max(dim=1, keepdim=True).values  # (B,1,H,W)
+
         # ── Occupancy supervision mask ──────────────────────────────────────────
         if informative_only:
-            if neighbor_sup_only_visible:
-                # True NOMAE: dilate only VISIBLE occupied cells
-                visible_occ = target_occ * (1.0 - mask)
-                visible_nbhd = self._build_visible_neighborhood(visible_occ)   # (B,S,H,W)
-                informative = (visible_nbhd.max(dim=1, keepdim=True).values > 0.0).float()
+            if neighbor_sup_only_visible and visible_nbhd_max is not None:
+                informative = (visible_nbhd_max > 0.0).float()
             else:
-                # Original: any occupied neighbor (including masked cells)
                 informative = (occ_tgt_ms.max(dim=1, keepdim=True).values > 0.0).float()
             occ_sup_mask = mask * informative
         else:
@@ -485,15 +497,27 @@ class NOMAEPCPPretrainHead(nn.Module):
 
         loss_occ = self._occ_loss(pred_occ, occ_tgt_ms, occ_sup_mask)
 
+        # ── PCP: residual target (Method 1) ────────────────────────────────────
+        # Remove "predict grid position" shortcut: predict delta from visible-cell mean.
+        if pcp_residual_center:
+            n_vis = vis_occ.sum(dim=[2, 3], keepdim=True).clamp(min=1.0)  # (B,1,1,1)
+            mean_xyz = (target_center * vis_occ).sum(dim=[2, 3], keepdim=True) / n_vis  # (B,3,1,1)
+            target_pcp = target_center - mean_xyz  # delta: much smaller variance, harder to fake
+        else:
+            target_pcp = target_center
+
         # ── PCP anti-leakage two-stage center prediction ────────────────────────
         pred_center_stage1 = self.center_head_stage1(feat)
         pred_token = pred_center_stage1.detach() if self.pcp_stopgrad_replace else pred_center_stage1
-        replaced_center = torch.where(mask.expand_as(target_center) > 0.5, pred_token, target_center)
+        # Stage 2 context: visible cells see true delta/center; masked cells see stage1 prediction
+        replaced_center = torch.where(mask.expand_as(target_pcp) > 0.5, pred_token, target_pcp)
         pred_center = self.center_head_stage2(torch.cat([feat, replaced_center], dim=1))
 
-        center_loss_map = F.smooth_l1_loss(pred_center, target_center, reduction="none").mean(
+        center_loss_map = F.smooth_l1_loss(pred_center, target_pcp, reduction="none").mean(
             dim=1, keepdim=True
         )
+
+        # ── PCP supervision mask ───────────────────────────────────────────────
         if pcp_informative_only:
             pcp_sup_mask = mask * (target_occ > 0.5).float()
             if pcp_sup_mask.sum() <= 0:
@@ -501,7 +525,16 @@ class NOMAEPCPPretrainHead(nn.Module):
         else:
             pcp_sup_mask = mask
 
-        # P1 fix: use Euclidean distance (not raw X coordinate) to identify near-range cells
+        # Far-only filter (Method 3): remove cells adjacent to visible occupied cells.
+        # Forces long-range reconstruction; adjacent cells can be trivially interpolated.
+        if pcp_far_only and visible_nbhd_max is not None:
+            far_from_visible = (visible_nbhd_max == 0.0).float()
+            pcp_far_mask = pcp_sup_mask * far_from_visible
+            if pcp_far_mask.sum() > 0:
+                pcp_sup_mask = pcp_far_mask
+            # else: fallback to standard mask (don't starve the loss)
+
+        # P1 fix: near-range weight still uses absolute distance (not delta)
         range_dist = target_center.norm(dim=1, keepdim=True)   # sqrt(x²+y²+z²) in meters
         near = (range_dist <= self.pcp_near_range_max).float()
 

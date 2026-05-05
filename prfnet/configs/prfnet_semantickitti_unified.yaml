@@ -141,12 +141,12 @@ pretrain:
 
   # 预训练损失权重
   lambda_occ: 1.0
-  lambda_pcp: 1.2          # PCP 权重略升，强化几何重建语义
+  lambda_pcp: 2.0          # PCP 信号易枯竭，权重提高以维持梯度贡献
   lambda_occ_rv: 1.0
   lambda_occ_pb: 1.0
-  lambda_pcp_rv: 1.2
-  lambda_pcp_pb: 1.0
-  log_interval: 20
+  lambda_pcp_rv: 2.0
+  lambda_pcp_pb: 1.5
+  log_interval: 500
 
   # -------- Phase A: mask curriculum + 早停 --------
   mask_curriculum_enable: true
@@ -174,6 +174,8 @@ pretrain:
   pcp_informative_only: true  # PCP 仅在信息性(占据)区域监督，避免空域零值捷径
   pcp_stopgrad_replace: true  # PCP 先预测中心再替换（stop-grad）
   neighbor_sup_only_visible: true  # OCC 仅在可见非掩码点邻域监督（true NOMAE）
+  pcp_residual_center: true   # PCP 预测残差偏移而非绝对坐标（消除位置记忆捷径）
+  pcp_far_only: true          # PCP 仅监督与可见点距离远的 cell（强制长程重建）
 
   # -------- Phase D: OCC 损失与 mask 采样约束 --------
   occ_scales: [1, 3, 5]       # 多尺度邻域占据建模
@@ -211,13 +213,13 @@ pretrain:
   # -------- Phase F: 预训练代理评估（挑best pretrain ckpt） --------
   probe_eval_enable: true
   probe_eval_every: 1
-  probe_train_steps: 300
-  probe_eval_steps: 100
+  probe_train_steps: 600
+  probe_eval_steps: 150
   probe_lr: 1.0e-2
   probe_weight_decay: 0.0
   probe_batch_size: 4
   probe_num_workers: 8
-  probe_patience_epochs: 3    # 连续N轮无改善则停止预训练
+  probe_patience_epochs: 8    # 连续N轮无改善则停止预训练
 
   # -------- Phase G: 跨视图一致性损失 --------
   cross_view_consistency_enable: true

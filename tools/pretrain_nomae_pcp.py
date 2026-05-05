@@ -424,6 +424,8 @@ def main() -> None:
     occ_pos_weight_min = float(pc.get("occ_pos_weight_min", 1.0))
     occ_pos_weight_max = float(pc.get("occ_pos_weight_max", 12.0))
     neighbor_sup_only_visible = bool(pc.get("neighbor_sup_only_visible", True))
+    pcp_residual_center = bool(pc.get("pcp_residual_center", True))
+    pcp_far_only = bool(pc.get("pcp_far_only", False))
     cross_view_consistency_enable = bool(pc.get("cross_view_consistency_enable", False))
     cv_stop_grad = bool(pc.get("cv_stop_grad", False))
     cv_only_visible = bool(pc.get("cv_only_visible", True))
@@ -450,6 +452,7 @@ def main() -> None:
         f"occ_loss={occ_loss_type}, occ_scales={occ_scales}, "
         f"mask_strategy={mask_strategy}, "
         f"neighbor_sup_only_visible={neighbor_sup_only_visible}, "
+        f"pcp_residual_center={pcp_residual_center}, pcp_far_only={pcp_far_only}, "
         f"pos_ratio_control={mask_pos_ratio_control_enable}, "
         f"cross_view_consistency={cross_view_consistency_enable}"
     )
@@ -581,6 +584,8 @@ def main() -> None:
                     hmg_coarse_stride=hmg_coarse_stride,
                     hmg_fine_extra_ratio=hmg_fine_extra_ratio,
                     neighbor_sup_only_visible=neighbor_sup_only_visible,
+                    pcp_residual_center=pcp_residual_center,
+                    pcp_far_only=pcp_far_only,
                     cross_view_consistency_enable=cross_view_consistency_enable,
                     cv_stop_grad=cv_stop_grad,
                     cv_only_visible=cv_only_visible,

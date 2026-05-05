@@ -255,6 +255,8 @@ class PRFNet(nn.Module):
         pcp_near_range_max: float = 10.0,
         pcp_near_weight: float = 1.5,
         neighbor_sup_only_visible: bool = True,
+        pcp_residual_center: bool = True,
+        pcp_far_only: bool = False,
         cross_view_consistency_enable: bool = False,
         lambda_cv: float = 0.1,
         cv_stop_grad: bool = False,
@@ -367,18 +369,26 @@ class PRFNet(nn.Module):
         self.pretrain_head_pb.pcp_near_range_max = float(max(1e-6, pcp_near_range_max))
         self.pretrain_head_rv.pcp_near_weight = float(max(1.0, pcp_near_weight))
         self.pretrain_head_pb.pcp_near_weight = float(max(1.0, pcp_near_weight))
+        self.pretrain_head_rv.pcp_residual_center = bool(pcp_residual_center)
+        self.pretrain_head_pb.pcp_residual_center = bool(pcp_residual_center)
+        self.pretrain_head_rv.pcp_far_only = bool(pcp_far_only)
+        self.pretrain_head_pb.pcp_far_only = bool(pcp_far_only)
 
         rv_ret = self.pretrain_head_rv(
             rv_out, rv_mask, rv_occ_tgt, rv_center_tgt,
             informative_only=informative_occ_only,
             pcp_informative_only=pcp_informative_only,
             neighbor_sup_only_visible=neighbor_sup_only_visible,
+            pcp_residual_center=pcp_residual_center,
+            pcp_far_only=pcp_far_only,
         )
         pb_ret = self.pretrain_head_pb(
             pb_out, pb_mask, pb_occ_tgt, pb_center_tgt,
             informative_only=informative_occ_only,
             pcp_informative_only=pcp_informative_only,
             neighbor_sup_only_visible=neighbor_sup_only_visible,
+            pcp_residual_center=pcp_residual_center,
+            pcp_far_only=pcp_far_only,
         )
 
         out = {
