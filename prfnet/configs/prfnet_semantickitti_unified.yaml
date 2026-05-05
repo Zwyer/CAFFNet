@@ -14,7 +14,7 @@ data:
   fov_up: 2.0
   fov_down: -24.8
   R_max: 85.0
-  batch_size: 4
+  batch_size: 2
   num_workers: 20
   val_batch_size: 4
   val_num_workers: 24
@@ -70,7 +70,7 @@ train:
   epochs: 150
   seed: 42
   optimizer: adamw
-  lr: 3.0e-4
+  lr: 2.0e-4
   weight_decay: 1.0e-4
   grad_clip: 10.0
   scheduler: cosine
