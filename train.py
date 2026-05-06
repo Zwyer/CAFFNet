@@ -485,6 +485,7 @@ def main(args):
         train_ds, batch_size=dc['batch_size'],
         shuffle=True, num_workers=dc['num_workers'],
         collate_fn=collate_fn, pin_memory=True, drop_last=True,
+        persistent_workers=True, prefetch_factor=4,
     )
     val_loader = DataLoader(
         val_ds, batch_size=dc.get('val_batch_size', 4), shuffle=False,

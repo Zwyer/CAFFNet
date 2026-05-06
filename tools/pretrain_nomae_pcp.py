@@ -327,6 +327,8 @@ def main() -> None:
             collate_fn=collate_fn,
             pin_memory=True,
             drop_last=True,
+            persistent_workers=True,
+            prefetch_factor=4,
         )
     except (FileNotFoundError, PermissionError) as e:
         if not args.dry_run:
