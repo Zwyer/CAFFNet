@@ -212,16 +212,16 @@ pretrain:
   mask_pos_ratio_max: 0.50
   mask_resample_max_tries: 5
 
-  # -------- Phase F: 预训练代理评估（挑best pretrain ckpt） --------
+  # -------- Phase F: 预训练代理评估（仅监控，不影响ckpt选择） --------
   probe_eval_enable: true
-  probe_eval_every: 1
+  probe_eval_every: 2        # 每2epoch评一次，用于观察特征质量曲线
   probe_train_steps: 2000
   probe_eval_steps: 300
   probe_lr: 1.0e-2
   probe_weight_decay: 0.0
   probe_batch_size: 4
   probe_num_workers: 8
-  probe_patience_epochs: 20    # 跑满20epoch，probe步数更多后信号稳定，从中选最优
+  probe_patience_epochs: 0   # 0=禁用probe早停，跑满全程，微调直接用latest.pth
 
   # -------- Phase G: 跨视图一致性损失 --------
   cross_view_consistency_enable: true
