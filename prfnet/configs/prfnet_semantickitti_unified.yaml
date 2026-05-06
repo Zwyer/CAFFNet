@@ -29,6 +29,8 @@ data:
   polarmix_sectors: 8
   use_lasermix: true
   lasermix_p: 0.5
+  use_surface_normals: true   # pretrain_nomae_pcp.py 从 data 节读取
+  use_angle_encoding: true    # 与 model 节保持一致，确保 pretrain/finetune 均用 rv_in=12
   low_label_finetune:
     enable: true
     num_frames: 200      # 改成 100 即可做 100 帧微调
@@ -213,13 +215,13 @@ pretrain:
   # -------- Phase F: 预训练代理评估（挑best pretrain ckpt） --------
   probe_eval_enable: true
   probe_eval_every: 1
-  probe_train_steps: 600
-  probe_eval_steps: 150
+  probe_train_steps: 2000
+  probe_eval_steps: 300
   probe_lr: 1.0e-2
   probe_weight_decay: 0.0
   probe_batch_size: 4
   probe_num_workers: 8
-  probe_patience_epochs: 8    # 连续N轮无改善则停止预训练
+  probe_patience_epochs: 20    # 跑满20epoch，probe步数更多后信号稳定，从中选最优
 
   # -------- Phase G: 跨视图一致性损失 --------
   cross_view_consistency_enable: true
