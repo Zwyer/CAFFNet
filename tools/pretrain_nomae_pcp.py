@@ -112,7 +112,8 @@ def run_linear_probe_eval(
         points = batch["points"].to(device, non_blocking=True)
         labels = batch["labels"].to(device, non_blocking=True)
 
-        feat = model.extract_pretrain_point_features(rv_img, pb_img, rv_coords, pb_coords, points)
+        with torch.no_grad():
+            feat = model.extract_pretrain_point_features(rv_img, pb_img, rv_coords, pb_coords, points)
         B, N, D = feat.shape
         feat_flat = feat.reshape(B * N, D)
         labels_flat = labels.reshape(B * N)
@@ -127,7 +128,7 @@ def run_linear_probe_eval(
         if train_iters >= train_steps:
             break
         probe_head.train()
-        logits = probe_head(feat_flat[valid])
+        logits = probe_head(feat_flat[valid].detach())
         loss = nn.functional.cross_entropy(logits, labels_flat[valid])
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -139,32 +140,33 @@ def run_linear_probe_eval(
             model.train()
         return 0.0
 
-    for batch in eval_loader:
-        if eval_steps <= 0:
-            break
-        rv_img = batch["rv_img"].to(device, non_blocking=True)
-        pb_img = batch["pb_img"].to(device, non_blocking=True)
-        rv_coords = batch["rv_coords"].to(device, non_blocking=True)
-        pb_coords = batch["pb_coords"].to(device, non_blocking=True)
-        points = batch["points"].to(device, non_blocking=True)
-        labels = batch["labels"].to(device, non_blocking=True)
+    with torch.no_grad():
+        for batch in eval_loader:
+            if eval_steps <= 0:
+                break
+            rv_img = batch["rv_img"].to(device, non_blocking=True)
+            pb_img = batch["pb_img"].to(device, non_blocking=True)
+            rv_coords = batch["rv_coords"].to(device, non_blocking=True)
+            pb_coords = batch["pb_coords"].to(device, non_blocking=True)
+            points = batch["points"].to(device, non_blocking=True)
+            labels = batch["labels"].to(device, non_blocking=True)
 
-        feat = model.extract_pretrain_point_features(rv_img, pb_img, rv_coords, pb_coords, points)
-        B, N, _ = feat.shape
-        feat_flat = feat.reshape(B * N, -1)
-        labels_flat = labels.reshape(B * N)
-        valid = labels_flat != ignore_index
-        if valid.sum().item() <= 0:
-            continue
+            feat = model.extract_pretrain_point_features(rv_img, pb_img, rv_coords, pb_coords, points)
+            B, N, _ = feat.shape
+            feat_flat = feat.reshape(B * N, -1)
+            labels_flat = labels.reshape(B * N)
+            valid = labels_flat != ignore_index
+            if valid.sum().item() <= 0:
+                continue
 
-        probe_head.eval()
-        logits = probe_head(feat_flat)
-        preds = logits.argmax(dim=-1)
-        p = preds[valid].detach().cpu().numpy().astype(np.int64)
-        g = labels_flat[valid].detach().cpu().numpy().astype(np.int64)
-        idx = g * num_classes + p
-        eval_cm += np.bincount(idx, minlength=num_classes * num_classes).reshape(num_classes, num_classes)
-        eval_steps -= 1
+            probe_head.eval()
+            logits = probe_head(feat_flat)
+            preds = logits.argmax(dim=-1)
+            p = preds[valid].cpu().numpy().astype(np.int64)
+            g = labels_flat[valid].cpu().numpy().astype(np.int64)
+            idx = g * num_classes + p
+            eval_cm += np.bincount(idx, minlength=num_classes * num_classes).reshape(num_classes, num_classes)
+            eval_steps -= 1
 
     if was_training:
         model.train()
@@ -504,7 +506,6 @@ def main() -> None:
         ep_total = ep_occ = ep_pcp = 0.0
         ep_step_time = 0.0
         ep_grad_norm = 0.0
-        ep_rv_occ = ep_pb_occ = 0.0
         ep_mask_rv = ep_mask_pb = 0.0
         _iter_t_prev = time.time()
         if loader is None:
@@ -625,25 +626,21 @@ def main() -> None:
             else:
                 skipped_sched_steps += 1
 
-            ep_total += float(loss.item())
-            ep_occ += float(loss_dict["occ"].item())
-            ep_pcp += float(loss_dict["pcp"].item())
+            # 只提取必要的 scalar（避免每步多次 CPU-GPU 同步）
+            loss_val   = loss.item()
+            occ_val    = loss_dict["occ"].item()
+            pcp_val    = loss_dict["pcp"].item()
+            ep_total  += loss_val
+            ep_occ    += occ_val
+            ep_pcp    += pcp_val
             ep_step_time += (time.time() - _step_t0)
             if grad_is_finite:
                 ep_grad_norm += grad_norm_val
-            ep_rv_occ += float((rv_img[:, 3:4] > 0).float().mean().item())
-            ep_pb_occ += float(pb_img[:, 8:9].float().mean().item())
-            ep_mask_rv += float(outputs["rv_mask_ratio"].item())
-            ep_mask_pb += float(outputs["pb_mask_ratio"].item())
-            rv_masked_pos_ratio = float(outputs["rv_masked_pos_ratio"].item())
-            pb_masked_pos_ratio = float(outputs["pb_masked_pos_ratio"].item())
-            rv_occ_effective_ratio = float(outputs["rv_occ_effective_ratio"].item())
-            pb_occ_effective_ratio = float(outputs["pb_occ_effective_ratio"].item())
-            rv_mask_resample = float(outputs["rv_mask_resample"].item())
-            pb_mask_resample = float(outputs["pb_mask_resample"].item())
+            ep_mask_rv += outputs["rv_mask_ratio"].item()
+            ep_mask_pb += outputs["pb_mask_ratio"].item()
 
-            ma_occ.append(float(loss_dict["occ"].item()))
-            ma_pcp.append(float(loss_dict["pcp"].item()))
+            ma_occ.append(occ_val)
+            ma_pcp.append(pcp_val)
             if grad_is_finite:
                 ma_gn.append(grad_norm_val)
             occ_ma = _ma(ma_occ)
@@ -682,60 +679,41 @@ def main() -> None:
                 early_stop_counter = 0
 
             lr = optimizer.param_groups[0]["lr"]
-            writer.add_scalar("pretrain/loss_step", ep_total / step, global_step)
-            writer.add_scalar("pretrain/occ_step", loss_dict["occ"], global_step)
-            writer.add_scalar("pretrain/pcp_step", loss_dict["pcp"], global_step)
-            if "occ_rv" in loss_dict:
-                writer.add_scalar("pretrain/occ_rv_step", loss_dict["occ_rv"], global_step)
-            if "occ_pb" in loss_dict:
-                writer.add_scalar("pretrain/occ_pb_step", loss_dict["occ_pb"], global_step)
-            if "pcp_rv" in loss_dict:
-                writer.add_scalar("pretrain/pcp_rv_step", loss_dict["pcp_rv"], global_step)
-            if "pcp_pb" in loss_dict:
-                writer.add_scalar("pretrain/pcp_pb_step", loss_dict["pcp_pb"], global_step)
-            if "cv" in loss_dict:
-                writer.add_scalar("pretrain/cv_step", loss_dict["cv"], global_step)
-            writer.add_scalar("pretrain/lr", lr, global_step)
-            writer.add_scalar("pretrain/rv_mask_ratio_step", outputs["rv_mask_ratio"], global_step)
-            writer.add_scalar("pretrain/pb_mask_ratio_step", outputs["pb_mask_ratio"], global_step)
-            writer.add_scalar("pretrain/occ_ma", occ_ma, global_step)
-            writer.add_scalar("pretrain/pcp_ma", pcp_ma, global_step)
-            writer.add_scalar("diag/gnorm_ma", gn_ma, global_step)
-            writer.add_scalar("diag/grad_norm_step", grad_norm_val, global_step)
-            writer.add_scalar("diag/grad_norm_finite_step", 1.0 if grad_is_finite else 0.0, global_step)
-            writer.add_scalar("diag/data_time_s_step", data_dt, global_step)
-            writer.add_scalar("diag/step_time_s_step", time.time() - _step_t0, global_step)
-            writer.add_scalar("diag/rv_occ_step", float((rv_img[:, 3:4] > 0).float().mean().item()), global_step)
-            writer.add_scalar("diag/pb_occ_step", float(pb_img[:, 8:9].float().mean().item()), global_step)
-            writer.add_scalar("diag/masked_positive_ratio_rv_step", rv_masked_pos_ratio, global_step)
-            writer.add_scalar("diag/masked_positive_ratio_pb_step", pb_masked_pos_ratio, global_step)
-            writer.add_scalar("diag/occ_effective_ratio_rv_step", rv_occ_effective_ratio, global_step)
-            writer.add_scalar("diag/occ_effective_ratio_pb_step", pb_occ_effective_ratio, global_step)
-            writer.add_scalar("diag/mask_resample_rv_step", rv_mask_resample, global_step)
-            writer.add_scalar("diag/mask_resample_pb_step", pb_mask_resample, global_step)
-            writer.add_scalar("diag/early_stop_counter_step", early_stop_counter, global_step)
-            writer.add_scalar("diag/overflow_steps_step", overflow_steps, global_step)
-            writer.add_scalar("diag/skipped_sched_steps_step", skipped_sched_steps, global_step)
-            if labels_cpu is not None:
-                valid = labels_cpu != 255
-                writer.add_scalar(
-                    "diag/points_valid_ratio_step",
-                    float(valid.sum().item()) / max(float(labels_cpu.numel()), 1.0),
-                    global_step,
-                )
-            if device.type == "cuda":
-                writer.add_scalar("diag/gpu_mem_alloc_mb_step",
-                                  torch.cuda.memory_allocated(device) / 1024.0 / 1024.0,
-                                  global_step)
-                writer.add_scalar("diag/gpu_mem_reserved_mb_step",
-                                  torch.cuda.memory_reserved(device) / 1024.0 / 1024.0,
-                                  global_step)
 
+            # TensorBoard 写入只在 log_interval 时做（减少每步 IO 开销）
             if step % log_interval == 0:
+                writer.add_scalar("pretrain/loss_step", ep_total / step, global_step)
+                writer.add_scalar("pretrain/occ_step", occ_val, global_step)
+                writer.add_scalar("pretrain/pcp_step", pcp_val, global_step)
+                if "occ_rv" in loss_dict:
+                    writer.add_scalar("pretrain/occ_rv_step", loss_dict["occ_rv"].item(), global_step)
+                if "occ_pb" in loss_dict:
+                    writer.add_scalar("pretrain/occ_pb_step", loss_dict["occ_pb"].item(), global_step)
+                if "pcp_rv" in loss_dict:
+                    writer.add_scalar("pretrain/pcp_rv_step", loss_dict["pcp_rv"].item(), global_step)
+                if "pcp_pb" in loss_dict:
+                    writer.add_scalar("pretrain/pcp_pb_step", loss_dict["pcp_pb"].item(), global_step)
+                if "cv" in loss_dict:
+                    writer.add_scalar("pretrain/cv_step", loss_dict["cv"].item(), global_step)
+                writer.add_scalar("pretrain/lr", lr, global_step)
+                writer.add_scalar("pretrain/rv_mask_ratio_step", outputs["rv_mask_ratio"].item(), global_step)
+                writer.add_scalar("pretrain/pb_mask_ratio_step", outputs["pb_mask_ratio"].item(), global_step)
+                writer.add_scalar("pretrain/occ_ma", occ_ma, global_step)
+                writer.add_scalar("pretrain/pcp_ma", pcp_ma, global_step)
+                writer.add_scalar("diag/gnorm_ma", gn_ma, global_step)
+                writer.add_scalar("diag/grad_norm_step", grad_norm_val, global_step)
+                writer.add_scalar("diag/rv_mask_resample_step", outputs["rv_mask_resample"].item(), global_step)
+                writer.add_scalar("diag/pb_mask_resample_step", outputs["pb_mask_resample"].item(), global_step)
+                writer.add_scalar("diag/early_stop_counter_step", early_stop_counter, global_step)
+                writer.add_scalar("diag/overflow_steps_step", overflow_steps, global_step)
+                if device.type == "cuda":
+                    writer.add_scalar("diag/gpu_mem_alloc_mb_step",
+                                      torch.cuda.memory_allocated(device) / 1024.0 / 1024.0,
+                                      global_step)
                 logger.info(
                     f"[pretrain] ep={epoch:03d}/{epochs} step={step:04d}/{(len(loader) if loader is not None else 1)} "
-                    f"loss={ep_total/step:.4f} occ={loss_dict['occ']:.4f} "
-                    f"pcp={loss_dict['pcp']:.4f} lr={lr:.2e} "
+                    f"loss={ep_total/step:.4f} occ={occ_val:.4f} "
+                    f"pcp={pcp_val:.4f} lr={lr:.2e} "
                     f"gnorm={grad_norm_val:.2f} "
                     f"occ_ma={occ_ma:.4e} pcp_ma={pcp_ma:.4e} gnorm_ma={gn_ma:.4f} "
                     f"overflow={overflow_steps} sched_skip={skipped_sched_steps}",
@@ -778,8 +756,6 @@ def main() -> None:
         writer.add_scalar("diag/grad_norm_epoch", ep_grad_norm / max(1, len(ma_gn)), epoch)
         writer.add_scalar("diag/overflow_steps_epoch", overflow_steps, epoch)
         writer.add_scalar("diag/skipped_sched_steps_epoch", skipped_sched_steps, epoch)
-        writer.add_scalar("diag/rv_occ_epoch", ep_rv_occ / n, epoch)
-        writer.add_scalar("diag/pb_occ_epoch", ep_pb_occ / n, epoch)
         writer.add_scalar("diag/step_time_s_epoch", ep_step_time / n, epoch)
         if device.type == "cuda":
             writer.add_scalar("diag/gpu_mem_alloc_mb_epoch",
