@@ -2,7 +2,7 @@
 
 data:
   dataset_name: 16lidar
-  root: /root/autodl-tmp/16lidar/dataset/
+  root: /root/autodl-tmp/16lidar_v1.0/dataset/
   num_classes: 19
   ignore_index: 255
   rv_H: 16
