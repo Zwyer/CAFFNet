@@ -65,7 +65,7 @@ model:
   pb_strides: [[2,2],[2,2],[2,2],[2,2]]
   aspp_rates: [1, 3, 6, 9]
   use_ds_aaff: true
-  ds_aaff_K: 4
+  ds_aaff_K: 2
   use_surface_normals: false
   use_angle_encoding: true
   use_vcg: false
