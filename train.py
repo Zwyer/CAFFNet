@@ -197,6 +197,18 @@ def _frame_key_from_frame(frame: dict) -> str:
     return f"{seq}/{stem}"
 
 
+def _parse_csv_seqs(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        items = [x.strip() for x in value.split(",") if x.strip()]
+        return items if items else None
+    if isinstance(value, (list, tuple)):
+        items = [str(x).strip() for x in value if str(x).strip()]
+        return items if items else None
+    return None
+
+
 def _load_selected_frame_keys(list_path: str):
     """
     读取选帧清单。
@@ -634,8 +646,14 @@ def main(args):
         f'(surface_normals={_use_normals}, angle_encoding={_use_angle})'
     )
 
+    train_seqs = _parse_csv_seqs(dc.get('train_seqs', None))
+    val_seqs = _parse_csv_seqs(dc.get('val_seqs', None))
+    require_labels = bool(dc.get('require_labels', True))
+
     train_ds = SemanticKITTIDataset(
         root=dc['root'], split='train',
+        seqs=train_seqs,
+        require_labels=require_labels,
         rv_H=dc['rv_H'], rv_W=dc['rv_W'],
         pb_H=dc['pb_H'], pb_W=dc['pb_W'],
         augment=dc['augment'],
@@ -742,6 +760,8 @@ def main(args):
 
     val_ds = SemanticKITTIDataset(
         root=dc['root'], split='val',
+        seqs=val_seqs,
+        require_labels=True,
         rv_H=dc['rv_H'], rv_W=dc['rv_W'],
         pb_H=dc['pb_H'], pb_W=dc['pb_W'],
         R_max=dc.get('R_max', 80.0),

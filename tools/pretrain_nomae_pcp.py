@@ -39,6 +39,18 @@ def load_cfg(path: str) -> dict:
         return yaml.safe_load(f)
 
 
+def _parse_csv_seqs(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        items = [x.strip() for x in value.split(",") if x.strip()]
+        return items if items else None
+    if isinstance(value, (list, tuple)):
+        items = [str(x).strip() for x in value if str(x).strip()]
+        return items if items else None
+    return None
+
+
 def setup_logger(save_dir: str) -> logging.Logger:
     os.makedirs(save_dir, exist_ok=True)
     log_file = os.path.join(save_dir, "pretrain.log")
@@ -243,6 +255,8 @@ def build_probe_loader(
     ds = SemanticKITTIDataset(
         root=cfg_data["root"],
         split=split,
+        seqs=_parse_csv_seqs(cfg_data.get("train_seqs", None) if split == "train" else cfg_data.get("val_seqs", None)),
+        require_labels=bool(cfg_data.get("require_labels", False)),
         rv_H=cfg_data["rv_H"],
         rv_W=cfg_data["rv_W"],
         pb_H=cfg_data["pb_H"],
@@ -356,6 +370,8 @@ def main() -> None:
         ds = SemanticKITTIDataset(
             root=dc["root"],
             split="train",
+            seqs=_parse_csv_seqs(dc.get("train_seqs", None)),
+            require_labels=bool(dc.get("require_labels", False)),
             rv_H=dc["rv_H"],
             rv_W=dc["rv_W"],
             pb_H=dc["pb_H"],

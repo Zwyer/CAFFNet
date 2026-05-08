@@ -8,7 +8,7 @@ import yaml
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 from ..utils.projection import RangeImageProjector, PolarBEVProjector
 from .instance_bank import InstanceBank
@@ -230,6 +230,8 @@ class SemanticKITTIDataset(Dataset):
     def __init__(self,
                  root: str,
                  split: str = 'train',
+                 seqs: Optional[Union[str, Sequence[str]]] = None,
+                 require_labels: bool = True,
                  rv_H: int = 64,  rv_W: int = 512,
                  pb_H: int = 240, pb_W: int = 512,
                  augment: bool = True,
@@ -262,19 +264,29 @@ class SemanticKITTIDataset(Dataset):
         self.max_points = max_points
         self.R_max = R_max
         self.rv_H = rv_H
+        self.require_labels = require_labels and (split != 'test')
 
-        if split == 'train':
-            seqs = TRAIN_SEQS
-        elif split == 'val':
-            seqs = VAL_SEQS
+        if seqs is None:
+            if split == 'train':
+                seq_list = list(TRAIN_SEQS)
+            elif split == 'val':
+                seq_list = list(VAL_SEQS)
+            else:
+                seq_list = list(TEST_SEQS)
         else:
-            seqs = TEST_SEQS
+            if isinstance(seqs, str):
+                seq_list = [s.strip() for s in seqs.split(',') if s.strip()]
+            else:
+                seq_list = [str(s).strip() for s in seqs if str(s).strip()]
+        self.seqs = seq_list
 
         # 构建帧文件列表
         self.frames: List[Dict[str, str]] = []
-        for seq in seqs:
+        for seq in self.seqs:
             velo_dir  = os.path.join(root, 'sequences', seq, 'velodyne')
             label_dir = os.path.join(root, 'sequences', seq, 'labels')
+            if not os.path.isdir(velo_dir):
+                continue
             bins = sorted(os.listdir(velo_dir))
             for b in bins:
                 stem = b.replace('.bin', '')
@@ -283,7 +295,11 @@ class SemanticKITTIDataset(Dataset):
                     'seq':  seq,
                 }
                 if split != 'test':
-                    entry['label'] = os.path.join(label_dir, stem + '.label')
+                    label_path = os.path.join(label_dir, stem + '.label')
+                    if os.path.isfile(label_path):
+                        entry['label'] = label_path
+                    elif self.require_labels:
+                        continue
                 self.frames.append(entry)
 
         # 建立 label 映射表（uint16 → train_id）
@@ -464,7 +480,7 @@ class SemanticKITTIDataset(Dataset):
         dist = np.linalg.norm(pts[:, :3], axis=1)
         pts = pts[dist > 0.5]
 
-        if 'label' in entry:
+        if 'label' in entry and os.path.isfile(entry['label']):
             raw_labels = np.fromfile(entry['label'], dtype=np.uint32)
             raw_labels = raw_labels.reshape(-1) & 0xFFFF   # 取低16位语义标签
             raw_labels = raw_labels[dist > 0.5]

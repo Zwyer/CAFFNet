@@ -3,6 +3,9 @@
 data:
   dataset_name: 16lidar
   root: /root/autodl-tmp/16lidar_v1.0/
+  train_seqs: "00,01,02,03,04,05,06"
+  val_seqs: ""
+  require_labels: false
   num_classes: 19
   ignore_index: 255
   rv_H: 16
