@@ -13,8 +13,8 @@ data:
   pb_H: 256
   pb_W: 1024
   max_points: 65536
-  fov_up: 15.0
-  fov_down: -15.0
+  fov_up: 14.0
+  fov_down: -16.0
   R_max: 85.0
   batch_size: 4
   num_workers: 12
