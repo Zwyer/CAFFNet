@@ -33,12 +33,15 @@ data:
   use_angle_encoding: true    # 与 model 节保持一致，确保 pretrain/finetune 均用 rv_in=12
   low_label_finetune:
     enable: true
-    num_frames: 200      # 改成 100 即可做 100 帧微调
+    num_frames: 300
     seed: 42
     balance_by_seq: true
+    selected_frames_path: selected_frames_select.txt
+    selected_frames_strict: true
+    selected_frames_fill_random: false
     dump_indices_path: selected_train_indices.txt
   copy_paste:
-    enable: true
+    enable: false
     bank_path: "instance_bank_semantickitti.npz"
     classes:
       7: {prob: 0.90, k: 3}
@@ -74,6 +77,14 @@ train:
   optimizer: adamw
   lr: 2.0e-4
   weight_decay: 1.0e-4
+  layerwise_lr:
+    enable: true
+    lr_mult_backbone: 0.20
+    lr_mult_mid: 0.50
+    lr_mult_head: 1.00
+    wd_mult_backbone: 1.00
+    wd_mult_mid: 1.00
+    wd_mult_head: 1.00
   grad_clip: 10.0
   scheduler: cosine
   pct_start: 0.10
@@ -124,9 +135,9 @@ log:
 # ---------------- Pretrain (NOMAE + PCP) ----------------
 pretrain:
   # 训练轮次与优化器
-  epochs: 20
+  epochs: 30
   seed: 42
-  lr: 4.0e-4
+  lr: 3.0e-4
   weight_decay: 1.0e-4
   grad_clip: 10.0
   amp: true
@@ -213,7 +224,7 @@ pretrain:
   mask_resample_max_tries: 5
 
   # -------- Phase F: 预训练代理评估（仅监控，不影响ckpt选择） --------
-  probe_eval_enable: true
+  probe_eval_enable: false
   probe_eval_every: 2        # 每2epoch评一次，用于观察特征质量曲线
   probe_train_steps: 2000
   probe_eval_steps: 300
@@ -222,6 +233,13 @@ pretrain:
   probe_batch_size: 4
   probe_num_workers: 8
   probe_patience_epochs: 0   # 0=禁用probe早停，跑满全程，微调直接用latest.pth
+
+  # -------- 无监督 RankMe 评估（可替代/补充 proxy mIoU） --------
+  rankme_eval_enable: true
+  rankme_eval_every: 1
+  rankme_eval_steps: 80
+  rankme_eval_max_points: 30000
+  rankme_center: true
 
   # -------- Phase G: 跨视图一致性损失 --------
   cross_view_consistency_enable: true
@@ -244,4 +262,34 @@ pretrain_model:
   use_proto: false
 
 pretrain_log:
-  save_dir: runs/prfnet_pretrain_nomae_pcp
+  save_dir: runs/prfnet_pretrain_rankme
+
+# ---------------- Active Selection (SELECT-style) ----------------
+select:
+  enable: true
+  seqs: "00,01,02,03,04,05,06,07,09,10"
+  budget: 300
+  # ensemble checkpoints（可选）：用逗号字符串或 glob 模式
+  ckpt_list: ""
+  ckpt_glob: ""
+  candidate_pool_ratio: 0.35
+  candidate_pool_min: 1200
+  candidate_rep_ratio: 0.15
+  candidate_rep_min: 400
+  mc_passes: 6
+  ensemble_max_models: 3
+  uncertainty_use_entropy: 1
+  uncertainty_use_mi: 1
+  uncertainty_use_vr: 1
+  w_unc_mi: 1.0
+  w_unc_entropy: 0.5
+  w_unc_vr: 0.5
+  r_min: 0.5
+  r_max: 85.0
+  max_points: 131072
+  w_unc: 1.0
+  w_rep: 1.0
+  w_bal: 0.6
+  temporal_min_stem_gap: 8
+  seed: 42
+  out_txt: selected_frames_select.txt

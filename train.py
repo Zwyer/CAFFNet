@@ -14,6 +14,7 @@ import logging
 import shutil
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, List, Tuple
 
 import yaml
 import numpy as np
@@ -188,6 +189,228 @@ def _build_low_label_subset(dataset: SemanticKITTIDataset,
         seq_counts[seq] = seq_counts.get(seq, 0) + 1
 
     return Subset(dataset, chosen.tolist()), chosen.tolist(), seq_counts
+
+
+def _frame_key_from_frame(frame: dict) -> str:
+    seq = str(frame["seq"])
+    stem = os.path.splitext(os.path.basename(frame["velo"]))[0]
+    return f"{seq}/{stem}"
+
+
+def _load_selected_frame_keys(list_path: str):
+    """
+    读取选帧清单。
+    允许每行格式：
+      seq/stem
+      seq/stem  <任意附加信息>
+    """
+    keys: List[str] = []
+    malformed = 0
+    with open(list_path, "r", encoding="utf-8") as f:
+        for ln, line in enumerate(f, 1):
+            s = line.strip()
+            if (not s) or s.startswith("#"):
+                continue
+            token = s.split()[0].replace("\\", "/")
+            if "/" not in token:
+                malformed += 1
+                continue
+            seq, stem = token.split("/", 1)
+            seq = seq.strip()
+            stem = stem.strip()
+            if (not seq) or (not stem):
+                malformed += 1
+                continue
+            keys.append(f"{seq}/{stem}")
+    # 去重并保留顺序
+    uniq = []
+    seen = set()
+    for k in keys:
+        if k not in seen:
+            seen.add(k)
+            uniq.append(k)
+    return uniq, malformed
+
+
+def _build_low_label_subset_from_file(dataset: SemanticKITTIDataset,
+                                      list_path: str,
+                                      subset_frames: int,
+                                      subset_seed: int,
+                                      strict: bool = False,
+                                      fill_random_if_insufficient: bool = True):
+    """
+    根据外部选帧清单构造低标注子集。
+    """
+    key_to_idx = {}
+    for i, frame in enumerate(dataset.frames):
+        key_to_idx[_frame_key_from_frame(frame)] = i
+
+    selected_keys, malformed = _load_selected_frame_keys(list_path)
+    found_idx: List[int] = []
+    missing_keys: List[str] = []
+    seen_idx = set()
+
+    for k in selected_keys:
+        idx = key_to_idx.get(k, None)
+        if idx is None:
+            missing_keys.append(k)
+            continue
+        if idx not in seen_idx:
+            seen_idx.add(idx)
+            found_idx.append(int(idx))
+
+    if strict and (malformed > 0 or len(missing_keys) > 0):
+        raise ValueError(
+            f"selected frame list invalid: malformed={malformed}, missing={len(missing_keys)}"
+        )
+
+    target = subset_frames if subset_frames > 0 else len(found_idx)
+    chosen = list(found_idx)
+
+    # 如果清单不足目标帧数，可选用随机补齐（避免训练帧数低于预期）
+    if len(chosen) < target and fill_random_if_insufficient:
+        rng = np.random.default_rng(subset_seed)
+        chosen_set = set(chosen)
+        remain_pool = np.asarray([i for i in range(len(dataset)) if i not in chosen_set], dtype=np.int64)
+        need = min(target - len(chosen), len(remain_pool))
+        if need > 0:
+            extra = rng.choice(remain_pool, size=need, replace=False).astype(np.int64).tolist()
+            chosen.extend([int(x) for x in extra])
+
+    # 清单多于目标时，按清单顺序截断，保证可复现
+    if target > 0 and len(chosen) > target:
+        chosen = chosen[:target]
+
+    if len(chosen) <= 0:
+        raise ValueError("selected frame list produced empty subset")
+
+    seq_counts = {}
+    for i in chosen:
+        seq = dataset.frames[int(i)]["seq"]
+        seq_counts[seq] = seq_counts.get(seq, 0) + 1
+
+    stats = {
+        "list_total": len(selected_keys),
+        "malformed": int(malformed),
+        "found": len(found_idx),
+        "missing": len(missing_keys),
+        "missing_examples": missing_keys[:5],
+        "final_used": len(chosen),
+    }
+    return Subset(dataset, chosen), chosen, seq_counts, stats
+
+
+def _collect_trainable_params(module: nn.Module) -> List[nn.Parameter]:
+    return [p for p in module.parameters() if p.requires_grad]
+
+
+def _build_optimizer_with_layerwise_lr(model: PRFNet, tc: dict, logger: logging.Logger):
+    """
+    构建优化器：
+    - 默认：单组参数（与历史行为一致）
+    - layerwise_lr.enable=True：按模块分组设置不同 lr 倍率
+    """
+    lwc = tc.get('layerwise_lr', {})
+    enable = bool(lwc.get('enable', False))
+    base_lr = float(tc['lr'])
+    base_wd = float(tc['weight_decay'])
+
+    if not enable:
+        opt = torch.optim.AdamW(
+            model.parameters(),
+            lr=base_lr,
+            weight_decay=base_wd,
+        )
+        logger.info('Layer-wise LR: disabled (single param group)')
+        return opt
+
+    lr_mult_backbone = float(lwc.get('lr_mult_backbone', 0.2))
+    lr_mult_mid = float(lwc.get('lr_mult_mid', 0.5))
+    lr_mult_head = float(lwc.get('lr_mult_head', 1.0))
+
+    wd_mult_backbone = float(lwc.get('wd_mult_backbone', 1.0))
+    wd_mult_mid = float(lwc.get('wd_mult_mid', 1.0))
+    wd_mult_head = float(lwc.get('wd_mult_head', 1.0))
+
+    # 按 PRFNet 结构分组
+    backbone_params = []
+    for m in [model.rv_stem, model.pb_stem, model.rv_enc, model.pb_enc]:
+        backbone_params.extend(_collect_trainable_params(m))
+
+    mid_params = []
+    for m in [model.aaffs, model.rv_dec, model.pb_dec]:
+        mid_params.extend(_collect_trainable_params(m))
+
+    head_params = []
+    for m in [model.aggregator, model.rv_aux]:
+        head_params.extend(_collect_trainable_params(m))
+
+    seen = set()
+    def _uniq(params):
+        out = []
+        for p in params:
+            pid = id(p)
+            if pid not in seen:
+                seen.add(pid)
+                out.append(p)
+        return out
+
+    backbone_params = _uniq(backbone_params)
+    mid_params = _uniq(mid_params)
+    head_params = _uniq(head_params)
+
+    # 兜底：未被显式分到上述三组的参数，归入 head 组
+    other_params = []
+    for p in model.parameters():
+        if p.requires_grad and id(p) not in seen:
+            seen.add(id(p))
+            other_params.append(p)
+    if len(other_params) > 0:
+        head_params.extend(other_params)
+
+    param_groups = []
+    if len(backbone_params) > 0:
+        param_groups.append({
+            'name': 'backbone',
+            'params': backbone_params,
+            'lr': base_lr * lr_mult_backbone,
+            'weight_decay': base_wd * wd_mult_backbone,
+        })
+    if len(mid_params) > 0:
+        param_groups.append({
+            'name': 'mid',
+            'params': mid_params,
+            'lr': base_lr * lr_mult_mid,
+            'weight_decay': base_wd * wd_mult_mid,
+        })
+    if len(head_params) > 0:
+        param_groups.append({
+            'name': 'head',
+            'params': head_params,
+            'lr': base_lr * lr_mult_head,
+            'weight_decay': base_wd * wd_mult_head,
+        })
+
+    if len(param_groups) == 0:
+        # 极端保护：回退单组
+        logger.warning('Layer-wise LR enabled but no param groups found, fallback to single group.')
+        param_groups = [{
+            'name': 'all',
+            'params': [p for p in model.parameters() if p.requires_grad],
+            'lr': base_lr,
+            'weight_decay': base_wd,
+        }]
+
+    opt = torch.optim.AdamW(param_groups)
+
+    for i, g in enumerate(opt.param_groups):
+        n_params = sum(p.numel() for p in g['params'])
+        gname = g.get('name', f'group{i}')
+        logger.info(
+            f'Layer-wise LR group[{i}] {gname}: '
+            f'params={n_params/1e6:.2f}M  lr={g["lr"]:.2e}  wd={g["weight_decay"]:.2e}'
+        )
+    return opt
 
 
 # ─────────────────────────────────────────────────────────────
@@ -444,15 +667,63 @@ def main(args):
     ll_seed = int(low_label_cfg.get('seed', seed))
     ll_balance_by_seq = bool(low_label_cfg.get('balance_by_seq', True))
     ll_dump_path = low_label_cfg.get('dump_indices_path', 'selected_train_indices.txt')
+    ll_selected_path_raw = str(low_label_cfg.get('selected_frames_path', '')).strip()
+    ll_selected_strict = bool(low_label_cfg.get('selected_frames_strict', False))
+    ll_selected_fill_random = bool(low_label_cfg.get('selected_frames_fill_random', True))
+
+    ll_selected_path = ''
+    if ll_selected_path_raw:
+        if os.path.isabs(ll_selected_path_raw):
+            ll_selected_path = ll_selected_path_raw
+        else:
+            cfg_rel = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(args.cfg)), ll_selected_path_raw))
+            cwd_rel = os.path.abspath(ll_selected_path_raw)
+            if os.path.isfile(cwd_rel):
+                ll_selected_path = cwd_rel
+            elif os.path.isfile(cfg_rel):
+                ll_selected_path = cfg_rel
+            else:
+                ll_selected_path = cwd_rel
+
     if ll_enable and ll_frames > 0:
-        train_ds, chosen_idx, seq_counts = _build_low_label_subset(
-            train_ds, subset_frames=ll_frames, subset_seed=ll_seed,
-            balance_by_seq=ll_balance_by_seq,
-        )
-        logger.info(
-            f'Low-label finetune enabled: sampled {len(chosen_idx)} train frames '
-            f'(seed={ll_seed}, balance_by_seq={ll_balance_by_seq})'
-        )
+        if ll_selected_path:
+            if not os.path.isfile(ll_selected_path):
+                raise FileNotFoundError(
+                    f'Low-label selected_frames_path not found: {ll_selected_path}'
+                )
+            train_ds, chosen_idx, seq_counts, sel_stats = _build_low_label_subset_from_file(
+                train_ds,
+                list_path=ll_selected_path,
+                subset_frames=ll_frames,
+                subset_seed=ll_seed,
+                strict=ll_selected_strict,
+                fill_random_if_insufficient=ll_selected_fill_random,
+            )
+            logger.info(
+                'Low-label finetune enabled from selected list: '
+                f'used={len(chosen_idx)} target={ll_frames} seed={ll_seed} '
+                f'list={ll_selected_path}'
+            )
+            logger.info(
+                'Selected-list stats: '
+                f'total={sel_stats["list_total"]} found={sel_stats["found"]} '
+                f'missing={sel_stats["missing"]} malformed={sel_stats["malformed"]} '
+                f'final_used={sel_stats["final_used"]}'
+            )
+            if sel_stats["missing"] > 0:
+                logger.info(
+                    'Selected-list missing examples: ' +
+                    ', '.join(sel_stats["missing_examples"])
+                )
+        else:
+            train_ds, chosen_idx, seq_counts = _build_low_label_subset(
+                train_ds, subset_frames=ll_frames, subset_seed=ll_seed,
+                balance_by_seq=ll_balance_by_seq,
+            )
+            logger.info(
+                f'Low-label finetune enabled: sampled {len(chosen_idx)} train frames '
+                f'(seed={ll_seed}, balance_by_seq={ll_balance_by_seq})'
+            )
         logger.info(
             'Low-label seq distribution: ' +
             ', '.join([f'{k}:{v}' for k, v in sorted(seq_counts.items())])
@@ -546,10 +817,7 @@ def main(args):
     )
 
     # ── 优化器 ─────────────────────────────────────────────
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=tc['lr'], weight_decay=tc['weight_decay'],
-    )
+    optimizer = _build_optimizer_with_layerwise_lr(model, tc, logger)
     total_steps = len(train_loader) * tc['epochs']
     sched_type  = tc.get('scheduler', 'onecycle')
     if sched_type == 'cosine':

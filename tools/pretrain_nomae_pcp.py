@@ -31,6 +31,7 @@ if ROOT not in sys.path:
 from prfnet.datasets.semantickitti import SemanticKITTIDataset, collate_fn
 from prfnet.models.prfnet import PRFNet
 from prfnet.utils.loss import NOMAEPCPLoss
+from prfnet.utils.rankme import effective_rank_from_features
 
 
 def load_cfg(path: str) -> dict:
@@ -175,6 +176,62 @@ def run_linear_probe_eval(
     valid_cls = union > 0
     iou = np.where(valid_cls, inter / (union + 1e-10), np.nan)
     return float(np.nanmean(iou) * 100.0) if np.any(valid_cls) else 0.0
+
+
+@torch.no_grad()
+def run_rankme_eval(
+    model: PRFNet,
+    eval_loader: DataLoader,
+    device: torch.device,
+    max_steps: int = 50,
+    max_points: int = 20000,
+    center: bool = True,
+) -> float:
+    """
+    无监督 RankMe 评估：
+    - 提取逐点特征
+    - 随机采样若干点组成特征矩阵
+    - 计算有效秩（越高通常表示表征更丰富）
+    """
+    was_training = model.training
+    model.eval()
+
+    feat_chunks = []
+    n_collected = 0
+    steps = 0
+    for batch in eval_loader:
+        if steps >= max_steps or n_collected >= max_points:
+            break
+        rv_img = batch["rv_img"].to(device, non_blocking=True)
+        pb_img = batch["pb_img"].to(device, non_blocking=True)
+        rv_coords = batch["rv_coords"].to(device, non_blocking=True)
+        pb_coords = batch["pb_coords"].to(device, non_blocking=True)
+        points = batch["points"].to(device, non_blocking=True)
+
+        feat = model.extract_pretrain_point_features(rv_img, pb_img, rv_coords, pb_coords, points)
+        feat = feat.reshape(-1, feat.shape[-1])
+        if feat.shape[0] <= 0:
+            continue
+
+        remain = max_points - n_collected
+        take = min(int(remain), int(feat.shape[0]))
+        if take <= 0:
+            break
+        if take < feat.shape[0]:
+            idx = torch.randperm(feat.shape[0], device=feat.device)[:take]
+            feat = feat[idx]
+        feat_chunks.append(feat.detach().cpu())
+        n_collected += take
+        steps += 1
+
+    if was_training:
+        model.train()
+    if len(feat_chunks) == 0:
+        return 0.0
+
+    feats = torch.cat(feat_chunks, dim=0)  # (N, D)
+    rankme = effective_rank_from_features(feats, center=center)
+    return float(rankme)
 
 
 def build_probe_loader(
@@ -486,6 +543,12 @@ def main() -> None:
     probe_patience_epochs = int(pc.get("probe_patience_epochs", 0))   # 0 = disabled
     best_probe_miou = -1.0
     probe_no_improve_count = 0
+    rankme_eval_enable = bool(pc.get("rankme_eval_enable", False))
+    rankme_eval_every = int(pc.get("rankme_eval_every", 2))
+    rankme_eval_steps = int(pc.get("rankme_eval_steps", 50))
+    rankme_eval_max_points = int(pc.get("rankme_eval_max_points", 20000))
+    rankme_center = bool(pc.get("rankme_center", True))
+    best_rankme = -1.0
 
     probe_train_loader = None
     probe_eval_loader = None
@@ -495,6 +558,11 @@ def main() -> None:
         )
         probe_eval_loader = build_probe_loader(
             dc, split="val", batch_size=probe_batch_size, num_workers=probe_num_workers
+        )
+    rankme_loader = None
+    if rankme_eval_enable and loader is not None and not args.dry_run:
+        rankme_loader = build_probe_loader(
+            dc, split="train", batch_size=probe_batch_size, num_workers=probe_num_workers
         )
 
     global_step = 0
@@ -813,6 +881,34 @@ def main() -> None:
                 writer.close()
                 logger.info(f"done. outputs: {exp_dir}")
                 return
+
+        if (
+            rankme_eval_enable
+            and rankme_loader is not None
+            and (epoch % max(1, rankme_eval_every) == 0)
+            and not args.dry_run
+        ):
+            rankme_score = run_rankme_eval(
+                model=model,
+                eval_loader=rankme_loader,
+                device=device,
+                max_steps=rankme_eval_steps,
+                max_points=rankme_eval_max_points,
+                center=rankme_center,
+            )
+            writer.add_scalar("rankme/score", rankme_score, epoch)
+            logger.info(f"[rankme] epoch={epoch:03d} score={rankme_score:.4f}")
+            if rankme_score > best_rankme:
+                best_rankme = rankme_score
+                ckpt_rankme = {
+                    "epoch": epoch,
+                    "state_dict": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "cfg": cfg,
+                    "rankme": rankme_score,
+                }
+                torch.save(ckpt_rankme, os.path.join(ckpt_dir, "best_rankme.pth"))
+                logger.info(f"[rankme] new best_rankme saved: score={rankme_score:.4f}")
 
         if args.dry_run:
             break
