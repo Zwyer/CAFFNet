@@ -1,0 +1,34 @@
+# 标注 PCD 中的自定义类别 ID -> SemanticKITTI raw ID 映射表
+# 自定义 ID 由你的标注工具决定；raw ID 与 prfnet/datasets/semantickitti.py 的 LABEL_MAPPING 对应
+#
+# 写入 .label 时使用 raw ID，确保下游 dataset 类（依赖 SemanticKITTI 命名约定）正常工作。
+# 任何未在表中出现的自定义 ID 都会被写为 0（unlabeled）。
+#
+# 训练 ID 含义参考（仅供查表，不要在此填）：
+#   0 car  1 bicycle  2 motorcycle  3 truck  4 other-vehicle
+#   5 person  6 bicyclist  7 motorcyclist  8 road  9 parking
+#   10 sidewalk  11 other-ground  12 building  13 fence
+#   14 vegetation  15 trunk  16 terrain  17 pole  18 traffic-sign
+
+custom_to_raw:
+  # custom_id: raw_id   # 注释中给出训练 ID 便于核对
+  0:   0     # unlabeled
+  1:   10    # car            (train 0)
+  2:   11    # bicycle        (train 1)
+  3:   15    # motorcycle     (train 2)
+  4:   18    # truck          (train 3)
+  5:   20    # other-vehicle  (train 4)
+  6:   30    # person         (train 5)
+  7:   31    # bicyclist      (train 6)
+  8:   32    # motorcyclist   (train 7)
+  9:   40    # road           (train 8)
+  10:  44    # parking        (train 9)
+  11:  48    # sidewalk       (train 10)
+  12:  49    # other-ground   (train 11)
+  13:  50    # building       (train 12)
+  14:  51    # fence          (train 13)
+  15:  70    # vegetation     (train 14)
+  16:  71    # trunk          (train 15)
+  17:  72    # terrain        (train 16)
+  18:  80    # pole           (train 17)
+  19:  81    # traffic-sign   (train 18)
