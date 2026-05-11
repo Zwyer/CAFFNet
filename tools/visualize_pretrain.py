@@ -158,7 +158,7 @@ def build_model_from_cfg(cfg, device):
         use_proto=mc.get("use_proto", False),
         proto_dim=mc.get("proto_dim", 64),
     ).to(device)
-    return model, dc
+    return model, dc, mc
 
 
 def build_dataset_for_seqs(dc, seqs):
@@ -207,6 +207,15 @@ def main():
                     help="占据多尺度预测取第几个 scale 画图（0=最细）")
     ap.add_argument("--skip_ply", action="store_true",
                     help="跳过 .ply 输出（仅画 png）")
+    ap.add_argument(
+        "--feat_mode", default="fused",
+        choices=["fused", "full", "pt"],
+        help=(
+            "fused: 只用 rv_feat+pb_feat（encoder+decoder 输出，去掉 pt_enc 的 intensity 干扰）；"
+            "full: rv+pb+pt 全部（原始行为，PCA 易被 intensity 主导）；"
+            "pt: 只看 pt_enc（32 维，用于确认 intensity 是否主导颜色）"
+        ),
+    )
     args = ap.parse_args()
 
     cfg = load_cfg(args.cfg)
@@ -221,7 +230,7 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model, dc = build_model_from_cfg(cfg, device)
+    model, dc, mc = build_model_from_cfg(cfg, device)
     ckpt = torch.load(args.ckpt, map_location="cpu")
     sd = ckpt.get("state_dict", ckpt)
     missing, unexpected = model.load_state_dict(sd, strict=False)
@@ -258,9 +267,16 @@ def main():
 
         with torch.no_grad():
             # ── PCA → RGB ─────────────────────────────────────────
-            feat = model.extract_pretrain_point_features(
+            feat_full = model.extract_pretrain_point_features(
                 rv_img, pb_img, rv_coords, pb_coords, points
-            )[0]
+            )[0]  # (N, rv_c + pb_c + 32)
+            dec_c = mc["dec_out_c"]  # 每个视图的 decoder 输出维度
+            if args.feat_mode == "fused":
+                feat = feat_full[:, : dec_c * 2]   # rv_feat + pb_feat，去掉 pt_enc
+            elif args.feat_mode == "pt":
+                feat = feat_full[:, dec_c * 2 :]   # 只看 pt_enc（intensity 主导的 32 维）
+            else:
+                feat = feat_full                    # 全部（full，原始行为）
             rgb = pca_to_rgb(feat.float())
             xyz = points[0, :, :3].cpu().numpy()
 
