@@ -230,6 +230,31 @@ def _resolve_class_names(cfg: dict):
     return names[:n_cls]
 
 
+def _filter_state_dict_by_shape(model: nn.Module, state_dict: dict):
+    """
+    过滤掉与当前模型 shape 不一致的权重（常见于类别数变化导致的分类头不匹配）。
+    返回：
+      filtered_state: 可安全加载的子集
+      skipped: [(key, ckpt_shape, model_shape), ...]
+    """
+    model_state = model.state_dict()
+    filtered = {}
+    skipped = []
+    for k, v in state_dict.items():
+        if k not in model_state:
+            # 不在当前模型中的 key 由 load_state_dict(strict=False) 统一处理为 unexpected
+            filtered[k] = v
+            continue
+        if hasattr(v, 'shape') and hasattr(model_state[k], 'shape'):
+            ckpt_shape = tuple(v.shape)
+            model_shape = tuple(model_state[k].shape)
+            if ckpt_shape != model_shape:
+                skipped.append((k, ckpt_shape, model_shape))
+                continue
+        filtered[k] = v
+    return filtered, skipped
+
+
 def _load_selected_frame_keys(list_path: str):
     """
     读取选帧清单。
@@ -889,10 +914,25 @@ def main(args):
         # --resume-ema：加载 EMA 权重（评估时使用的权重，通常比 model 权重更好）
         # 默认加载 model 权重
         if args.resume_ema and 'ema_state_dict' in ckpt:
-            state = ckpt['ema_state_dict']
+            raw_state = ckpt['ema_state_dict']
             logger.info('Resume: 使用 ema_state_dict（EMA 权重，对应验证 mIoU 的实际状态）')
         else:
-            state = ckpt.get('state_dict', ckpt)
+            raw_state = ckpt.get('state_dict', ckpt)
+
+        state = raw_state
+        if args.strict_false:
+            state, skipped_mismatch = _filter_state_dict_by_shape(model, raw_state)
+            if skipped_mismatch:
+                show_n = 8
+                head = '; '.join(
+                    [f'{k}: ckpt{cs}!=model{ms}' for k, cs, ms in skipped_mismatch[:show_n]]
+                )
+                logger.info(
+                    f'Resume: skip {len(skipped_mismatch)} shape-mismatched keys '
+                    f'(likely classifier/head due to class-count change): {head}'
+                    f'{"; ..." if len(skipped_mismatch) > show_n else ""}'
+                )
+
         missing, unexpected = model.load_state_dict(
             state, strict=not args.strict_false
         )
