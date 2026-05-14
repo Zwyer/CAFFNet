@@ -362,6 +362,26 @@ def _collect_trainable_params(module: nn.Module) -> List[nn.Parameter]:
     return [p for p in module.parameters() if p.requires_grad]
 
 
+def _set_stage_trainable(model: PRFNet, head_only: bool, logger: logging.Logger):
+    """
+    两阶段微调参数冻结控制：
+    - head_only=True: 仅训练分类相关头部（aggregator + rv_aux）
+    - head_only=False: 全量可训练
+    """
+    if not head_only:
+        for p in model.parameters():
+            p.requires_grad = True
+        logger.info('Two-stage: set full-model trainable.')
+        return
+
+    for p in model.parameters():
+        p.requires_grad = False
+    for m in [model.aggregator, model.rv_aux]:
+        for p in m.parameters():
+            p.requires_grad = True
+    logger.info('Two-stage: stage1 head-only trainable (aggregator + rv_aux).')
+
+
 def _build_optimizer_with_layerwise_lr(model: PRFNet, tc: dict, logger: logging.Logger):
     """
     构建优化器：
@@ -469,6 +489,29 @@ def _build_optimizer_with_layerwise_lr(model: PRFNet, tc: dict, logger: logging.
             f'params={n_params/1e6:.2f}M  lr={g["lr"]:.2e}  wd={g["weight_decay"]:.2e}'
         )
     return opt
+
+
+def _build_scheduler(optimizer, tc: dict, total_steps: int, logger: logging.Logger):
+    sched_type = tc.get('scheduler', 'onecycle')
+    if sched_type == 'cosine':
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(total_steps, 1),
+            eta_min=tc.get('eta_min', 1e-6),
+        )
+    else:
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=tc['lr'],
+            total_steps=max(total_steps, 1),
+            pct_start=tc['pct_start'],
+        )
+    logger.info(
+        f'Scheduler: {sched_type}  lr={tc["lr"]}  '
+        f'{"eta_min=" + str(tc.get("eta_min", 1e-6)) if sched_type == "cosine" else "pct_start=" + str(tc["pct_start"])}  '
+        f'total_steps={max(total_steps, 1)}'
+    )
+    return scheduler
 
 
 # ─────────────────────────────────────────────────────────────
@@ -886,26 +929,49 @@ def main(args):
         focal_gamma=lc.get('focal_gamma', 2.0),
     )
 
-    # ── 优化器 ─────────────────────────────────────────────
-    optimizer = _build_optimizer_with_layerwise_lr(model, tc, logger)
-    total_steps = len(train_loader) * tc['epochs']
-    sched_type  = tc.get('scheduler', 'onecycle')
-    if sched_type == 'cosine':
-        # 热启动首选：从 lr 单调下降到 eta_min，无峰值冲击
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=total_steps,
-            eta_min=tc.get('eta_min', 1e-6),
+    # ── 两阶段微调配置（可选，默认关闭）──────────────────────
+    two_stage_cfg = tc.get('two_stage', {})
+    two_stage_enable = bool(two_stage_cfg.get('enable', False))
+    stage1_epochs = int(two_stage_cfg.get('stage1_epochs', 0))
+    if stage1_epochs < 0:
+        stage1_epochs = 0
+    if stage1_epochs >= int(tc['epochs']):
+        stage1_epochs = max(int(tc['epochs']) - 1, 0)
+    two_stage_active = two_stage_enable and stage1_epochs > 0
+
+    stage1_tc = dict(tc)
+    if two_stage_active:
+        if 'stage1_lr' in two_stage_cfg:
+            stage1_tc['lr'] = float(two_stage_cfg['stage1_lr'])
+        if 'stage1_weight_decay' in two_stage_cfg:
+            stage1_tc['weight_decay'] = float(two_stage_cfg['stage1_weight_decay'])
+        if 'stage1_scheduler' in two_stage_cfg:
+            stage1_tc['scheduler'] = str(two_stage_cfg['stage1_scheduler'])
+        if 'stage1_eta_min' in two_stage_cfg:
+            stage1_tc['eta_min'] = float(two_stage_cfg['stage1_eta_min'])
+        if 'stage1_pct_start' in two_stage_cfg:
+            stage1_tc['pct_start'] = float(two_stage_cfg['stage1_pct_start'])
+        if not bool(two_stage_cfg.get('stage1_layerwise', False)):
+            stage1_tc['layerwise_lr'] = {'enable': False}
+
+        _set_stage_trainable(model, head_only=True, logger=logger)
+        logger.info(
+            f'Two-stage finetune enabled: stage1(head-only)={stage1_epochs} epochs, '
+            f'stage2(full-layerwise)={int(tc["epochs"]) - stage1_epochs} epochs'
         )
     else:
-        # 从零训练默认：OneCycleLR
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer, max_lr=tc['lr'],
-            total_steps=total_steps,
-            pct_start=tc['pct_start'],
-        )
-    logger.info(f'Scheduler: {sched_type}  lr={tc["lr"]}  '
-                f'{"eta_min=" + str(tc.get("eta_min", 1e-6)) if sched_type == "cosine" else "pct_start=" + str(tc["pct_start"])}')
+        _set_stage_trainable(model, head_only=False, logger=logger)
+
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f'Trainable parameters: {n_trainable/1e6:.2f}M')
+
+    # ── 优化器 ─────────────────────────────────────────────
+    phase_tc = stage1_tc if two_stage_active else tc
+    phase_name = 'stage1_head_only' if two_stage_active else 'single_stage_full'
+    optimizer = _build_optimizer_with_layerwise_lr(model, phase_tc, logger)
+    total_steps = len(train_loader) * (stage1_epochs if two_stage_active else int(tc['epochs']))
+    scheduler = _build_scheduler(optimizer, phase_tc, total_steps, logger)
+    logger.info(f'Optimization phase: {phase_name}')
     scaler = torch.amp.GradScaler('cuda', enabled=tc['amp'])
 
     # ── Checkpoint 热启动（仅加载模型权重，optimizer/scheduler 从头开始）──
@@ -955,6 +1021,18 @@ def main(args):
     global_step = 0
 
     for epoch in range(1, tc['epochs'] + 1):
+        # 两阶段切换：进入 stage2 时解冻全量并重建优化器/调度器
+        if two_stage_active and epoch == (stage1_epochs + 1):
+            _set_stage_trainable(model, head_only=False, logger=logger)
+            n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            logger.info(f'Two-stage switch -> stage2 full finetune. Trainable={n_trainable/1e6:.2f}M')
+
+            optimizer = _build_optimizer_with_layerwise_lr(model, tc, logger)
+            stage2_epochs = int(tc['epochs']) - stage1_epochs
+            stage2_steps = len(train_loader) * max(stage2_epochs, 1)
+            scheduler = _build_scheduler(optimizer, tc, stage2_steps, logger)
+            logger.info('Optimization phase: stage2_full_layerwise')
+
         model.train()
         epoch_loss = 0.
         epoch_ce = epoch_lov = epoch_aux = 0.

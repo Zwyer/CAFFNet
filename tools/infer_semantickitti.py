@@ -63,6 +63,94 @@ from prfnet.utils.projection import RangeImageProjector, PolarBEVProjector
 
 
 # ─────────────────────────────────────────────────────────────
+# I/O helpers
+# ─────────────────────────────────────────────────────────────
+
+def _as_numpy(x):
+    if isinstance(x, np.ndarray):
+        return x
+    if torch.is_tensor(x):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
+
+
+def _write_pred_pcd_binary(path: str,
+                           pts_xyzi: np.ndarray,
+                           pred_train: np.ndarray,
+                           conf: np.ndarray = None,
+                           gt_train: np.ndarray = None):
+    """
+    写带预测字段的 binary PCD，便于可视化实际预测效果。
+
+    基础字段：
+      x y z intensity pred
+    可选字段：
+      conf, gt
+    """
+    n = int(pts_xyzi.shape[0])
+    if pred_train.shape[0] != n:
+        raise ValueError(f'pred length {pred_train.shape[0]} != points {n}')
+    if conf is not None and conf.shape[0] != n:
+        raise ValueError(f'conf length {conf.shape[0]} != points {n}')
+    if gt_train is not None and gt_train.shape[0] != n:
+        raise ValueError(f'gt length {gt_train.shape[0]} != points {n}')
+
+    fields = ['x', 'y', 'z', 'intensity', 'pred']
+    sizes = [4, 4, 4, 4, 4]
+    types = ['F', 'F', 'F', 'F', 'U']
+    counts = [1, 1, 1, 1, 1]
+    dtype_items = [
+        ('x', np.float32),
+        ('y', np.float32),
+        ('z', np.float32),
+        ('intensity', np.float32),
+        ('pred', np.uint32),
+    ]
+
+    if conf is not None:
+        fields.append('conf')
+        sizes.append(4)
+        types.append('F')
+        counts.append(1)
+        dtype_items.append(('conf', np.float32))
+    if gt_train is not None:
+        fields.append('gt')
+        sizes.append(4)
+        types.append('U')
+        counts.append(1)
+        dtype_items.append(('gt', np.uint32))
+
+    arr = np.empty(n, dtype=np.dtype(dtype_items))
+    arr['x'] = pts_xyzi[:, 0].astype(np.float32, copy=False)
+    arr['y'] = pts_xyzi[:, 1].astype(np.float32, copy=False)
+    arr['z'] = pts_xyzi[:, 2].astype(np.float32, copy=False)
+    arr['intensity'] = pts_xyzi[:, 3].astype(np.float32, copy=False)
+    arr['pred'] = pred_train.astype(np.uint32, copy=False)
+    if conf is not None:
+        arr['conf'] = conf.astype(np.float32, copy=False)
+    if gt_train is not None:
+        arr['gt'] = gt_train.astype(np.uint32, copy=False)
+
+    header = (
+        '# .PCD v0.7 - Point Cloud Data file format\n'
+        'VERSION 0.7\n'
+        f'FIELDS {" ".join(fields)}\n'
+        f'SIZE {" ".join(str(x) for x in sizes)}\n'
+        f'TYPE {" ".join(types)}\n'
+        f'COUNT {" ".join(str(x) for x in counts)}\n'
+        f'WIDTH {n}\n'
+        'HEIGHT 1\n'
+        'VIEWPOINT 0 0 0 1 0 0 0\n'
+        f'POINTS {n}\n'
+        'DATA binary\n'
+    )
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'wb') as f:
+        f.write(header.encode('ascii'))
+        arr.tofile(f)
+
+
+# ─────────────────────────────────────────────────────────────
 # train_id → 官方 SemanticKITTI 原始标签 ID
 # ─────────────────────────────────────────────────────────────
 TRAIN_TO_RAW = {
@@ -766,6 +854,13 @@ def run_val(models, cfg, device, knn_cfg, tta_cfg, infer_cfg, crf_cfg=None):
     num_cls  = dc['num_classes']
     ignore   = dc['ignore_index']
     R_max    = dc.get('R_max', 80.0)
+    save_pcd_cfg = infer_cfg.get('save_val_pcd', {}) or {}
+    save_pcd_enable = bool(save_pcd_cfg.get('enable', False))
+    save_pcd_dir = str(save_pcd_cfg.get('dir', ''))
+    save_pcd_every = max(1, int(save_pcd_cfg.get('every', 1)))
+    save_pcd_max_frames = int(save_pcd_cfg.get('max_frames', 0))
+    save_pcd_with_gt = bool(save_pcd_cfg.get('with_gt', True))
+    save_pcd_with_conf = bool(save_pcd_cfg.get('with_conf', False))
 
     # CRF 配置
     use_crf = crf_cfg.get('use_crf', False) if crf_cfg else False
@@ -798,7 +893,10 @@ def run_val(models, cfg, device, knn_cfg, tta_cfg, infer_cfg, crf_cfg=None):
     ens_desc = f'ens×{len(models)}'
     mcdo_desc = f'+MCDO×{mc_dropout_passes}' if mc_dropout_passes > 1 else ''
     crf_desc = '+CRF(adaptive)' if (use_crf and use_adaptive) else ('+CRF' if use_crf else '')
+    seen_count = 0
+    saved_count = 0
     for sample in tqdm(loader, desc=f'val [{ens_desc}{mcdo_desc}|{tta_desc}{crf_desc}]', dynamic_ncols=True):
+        seen_count += 1
         labels = sample['labels'].numpy()
 
         fns = tta_fns if use_tta else [_tta_identity]
@@ -833,7 +931,7 @@ def run_val(models, cfg, device, knn_cfg, tta_cfg, infer_cfg, crf_cfg=None):
         if use_crf and logits is not None:
             valid = labels != ignore
             if valid.any():
-                raw_pts = sample['raw_pts'].numpy()
+                raw_pts = _as_numpy(sample['raw_pts'])
                 # 提取 intensity（raw_pts 第4列）
                 intensity = raw_pts[valid, 3] if raw_pts.shape[1] > 3 else None
 
@@ -856,6 +954,33 @@ def run_val(models, cfg, device, knn_cfg, tta_cfg, infer_cfg, crf_cfg=None):
                 preds[valid] = crf_refine(**crf_params)
 
         metric.update(preds, labels)
+
+        if save_pcd_enable and save_pcd_dir:
+            allow_by_every = ((seen_count - 1) % save_pcd_every == 0)
+            allow_by_max = (save_pcd_max_frames <= 0) or (saved_count < save_pcd_max_frames)
+            if allow_by_every and allow_by_max:
+                raw_pts = _as_numpy(sample['raw_pts'])
+                valid_mask = _as_numpy(sample['valid_mask']).astype(bool)
+                pts_valid = raw_pts[valid_mask]
+                if pts_valid.shape[0] == preds.shape[0]:
+                    gt_vals = labels.astype(np.uint32) if save_pcd_with_gt else None
+                    conf_vals = confs.astype(np.float32) if (save_pcd_with_conf and confs is not None) else None
+                    seq = str(sample['seq'])
+                    stem = str(sample['stem'])
+                    out_path = os.path.join(save_pcd_dir, seq, f'{stem}.pcd')
+                    _write_pred_pcd_binary(
+                        out_path,
+                        pts_xyzi=pts_valid,
+                        pred_train=preds.astype(np.uint32),
+                        conf=conf_vals,
+                        gt_train=gt_vals,
+                    )
+                    saved_count += 1
+                else:
+                    print(f'[WARN] skip PCD save due to shape mismatch: pts={pts_valid.shape[0]} pred={preds.shape[0]}')
+
+    total_seen = int(seen_count)
+    total_saved = int(saved_count)
 
     elapsed = time.time() - t0
     per_cls = metric.per_class_iou()
@@ -910,6 +1035,8 @@ def run_val(models, cfg, device, knn_cfg, tta_cfg, infer_cfg, crf_cfg=None):
         else:
             print('  (no motorcyclist GT points in val set)')
     print(f'{"─"*60}\n')
+    if save_pcd_enable and save_pcd_dir:
+        print(f'PCD 导出: saved={total_saved}/{total_seen}  dir={os.path.abspath(save_pcd_dir)}')
 
     return miou, per_cls
 
@@ -1020,6 +1147,16 @@ def main():
                    help='强制使用 state_dict 而非 ema_state_dict')
     p.add_argument('--mc_dropout_passes', type=int, default=1,
                    help='MC Dropout 前向次数（>1 启用，推理更慢但更稳）')
+    p.add_argument('--save_val_pcd_dir', default=None,
+                   help='val 模式下导出预测 PCD 的目录（不填则关闭）')
+    p.add_argument('--save_val_pcd_every', type=int, default=1,
+                   help='val 模式每 N 帧导出 1 帧 PCD（默认1）')
+    p.add_argument('--save_val_pcd_max_frames', type=int, default=0,
+                   help='val 模式最多导出多少帧 PCD（0=不限制）')
+    p.add_argument('--save_val_pcd_with_gt', action='store_true',
+                   help='导出 PCD 时附带 gt 字段（仅 val 有效）')
+    p.add_argument('--save_val_pcd_with_conf', action='store_true',
+                   help='导出 PCD 时附带 conf 字段（预测置信度）')
 
     # KNN 覆盖开关
     p.add_argument('--use_knn',  action='store_true', default=None)
@@ -1104,6 +1241,14 @@ def main():
 
     infer_cfg = {
         'mc_dropout_passes': args.mc_dropout_passes,
+        'save_val_pcd': {
+            'enable': bool(args.save_val_pcd_dir),
+            'dir': args.save_val_pcd_dir or '',
+            'every': args.save_val_pcd_every,
+            'max_frames': args.save_val_pcd_max_frames,
+            'with_gt': args.save_val_pcd_with_gt,
+            'with_conf': args.save_val_pcd_with_conf,
+        },
     }
 
     # ── CRF 配置 ────────────────────────────────────────────
