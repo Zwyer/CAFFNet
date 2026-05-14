@@ -209,6 +209,27 @@ def _parse_csv_seqs(value):
     return None
 
 
+def _normalize_label_mapping(raw_mapping):
+    if raw_mapping is None:
+        return None
+    out = {}
+    for k, v in raw_mapping.items():
+        out[int(k)] = int(v)
+    return out
+
+
+def _resolve_class_names(cfg: dict):
+    data_cfg = cfg.get('data', {})
+    names = data_cfg.get('class_names', None)
+    n_cls = int(data_cfg.get('num_classes', len(CLASS_NAMES)))
+    if names is None:
+        return CLASS_NAMES[:n_cls]
+    names = [str(x) for x in names]
+    if len(names) < n_cls:
+        names = names + [f'class_{i}' for i in range(len(names), n_cls)]
+    return names[:n_cls]
+
+
 def _load_selected_frame_keys(list_path: str):
     """
     读取选帧清单。
@@ -611,6 +632,7 @@ def main(args):
     logger = setup_logger(exp_dir)
     writer = SummaryWriter(log_dir=os.path.join(exp_dir, 'tensorboard'),
                            flush_secs=lgc['tb_flush_secs'])
+    class_names = _resolve_class_names(cfg)
 
     logger.info(f'Experiment dir: {exp_dir}')
     logger.info(f'Config: {args.cfg}')
@@ -649,11 +671,13 @@ def main(args):
     train_seqs = _parse_csv_seqs(dc.get('train_seqs', None))
     val_seqs = _parse_csv_seqs(dc.get('val_seqs', None))
     require_labels = bool(dc.get('require_labels', True))
+    custom_label_mapping = _normalize_label_mapping(dc.get('label_mapping', None))
 
     train_ds = SemanticKITTIDataset(
         root=dc['root'], split='train',
         seqs=train_seqs,
         require_labels=require_labels,
+        label_mapping=custom_label_mapping,
         rv_H=dc['rv_H'], rv_W=dc['rv_W'],
         pb_H=dc['pb_H'], pb_W=dc['pb_W'],
         augment=dc['augment'],
@@ -762,6 +786,7 @@ def main(args):
         root=dc['root'], split='val',
         seqs=val_seqs,
         require_labels=True,
+        label_mapping=custom_label_mapping,
         rv_H=dc['rv_H'], rv_W=dc['rv_W'],
         pb_H=dc['pb_H'], pb_W=dc['pb_W'],
         R_max=dc.get('R_max', 80.0),
@@ -1021,7 +1046,7 @@ def main(args):
         cls_hist_sum = epoch_cls_hist.sum()
         if cls_hist_sum > 0:
             cls_freq = epoch_cls_hist / cls_hist_sum
-            for i, name in enumerate(CLASS_NAMES):
+            for i, name in enumerate(class_names):
                 writer.add_scalar(f'data/class_freq_{name}', float(cls_freq[i]), epoch)
         if device.type == 'cuda':
             writer.add_scalar('diag/gpu_mem_alloc_mb_epoch',
@@ -1077,16 +1102,16 @@ def main(args):
             # 逐类 IoU
             cls_line = '  '.join(
                 f'{name[:6]}:{iou:.1f}' if not np.isnan(iou) else f'{name[:6]}:--'
-                for name, iou in zip(CLASS_NAMES, per_cls)
+                for name, iou in zip(class_names, per_cls)
             )
             logger.info(f'   Per-class: {cls_line}')
             prec_line = '  '.join(
                 f'{name[:6]}:{p:.1f}' if not np.isnan(p) else f'{name[:6]}:--'
-                for name, p in zip(CLASS_NAMES, per_prec)
+                for name, p in zip(class_names, per_prec)
             )
             rec_line = '  '.join(
                 f'{name[:6]}:{r:.1f}' if not np.isnan(r) else f'{name[:6]}:--'
-                for name, r in zip(CLASS_NAMES, per_rec)
+                for name, r in zip(class_names, per_rec)
             )
             logger.info(f'   Precision: {prec_line}')
             logger.info(f'   Recall:    {rec_line}')
@@ -1098,13 +1123,13 @@ def main(args):
             )
 
             writer.add_scalar('val/mIoU', miou, epoch)
-            for name, iou in zip(CLASS_NAMES, per_cls):
+            for name, iou in zip(class_names, per_cls):
                 if not np.isnan(iou):
                     writer.add_scalar(f'val/iou_{name}', iou, epoch)
-            for name, p in zip(CLASS_NAMES, per_prec):
+            for name, p in zip(class_names, per_prec):
                 if not np.isnan(p):
                     writer.add_scalar(f'val/precision_{name}', p, epoch)
-            for name, r in zip(CLASS_NAMES, per_rec):
+            for name, r in zip(class_names, per_rec):
                 if not np.isnan(r):
                     writer.add_scalar(f'val/recall_{name}', r, epoch)
             for k, v in dist_iou.items():

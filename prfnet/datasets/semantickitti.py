@@ -252,6 +252,8 @@ class SemanticKITTIDataset(Dataset):
                  # ── 【创新①②】RV 特征增强开关 ────────────────
                  use_surface_normals: bool = False,
                  use_angle_encoding: bool = False,
+                 # 自定义标签映射（raw_label -> train_id）；None 时使用默认 SemanticKITTI 映射
+                 label_mapping: Optional[Dict[int, int]] = None,
                  # ── Copy-Paste 实例增强 ────────────────────
                  copy_paste_bank: Optional[InstanceBank] = None,
                  copy_paste_classes: Optional[dict] = None,
@@ -265,6 +267,10 @@ class SemanticKITTIDataset(Dataset):
         self.R_max = R_max
         self.rv_H = rv_H
         self.require_labels = require_labels and (split != 'test')
+        self.label_mapping = (
+            {int(k): int(v) for k, v in label_mapping.items()}
+            if label_mapping is not None else LABEL_MAPPING
+        )
 
         if seqs is None:
             if split == 'train':
@@ -464,7 +470,7 @@ class SemanticKITTIDataset(Dataset):
 
     def _build_label_lut(self):
         lut = np.full(65536, 255, dtype=np.int32)
-        for raw, train in LABEL_MAPPING.items():
+        for raw, train in self.label_mapping.items():
             if raw < 65536:
                 lut[raw] = train
         self.label_lut = lut
