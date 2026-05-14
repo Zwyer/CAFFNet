@@ -74,6 +74,39 @@ def _as_numpy(x):
     return np.asarray(x)
 
 
+def _parse_csv_seqs(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        items = [x.strip() for x in value.split(',') if x.strip()]
+        return items if items else None
+    if isinstance(value, (list, tuple)):
+        items = [str(x).strip() for x in value if str(x).strip()]
+        return items if items else None
+    return None
+
+
+def _normalize_label_mapping(raw_mapping):
+    if raw_mapping is None:
+        return None
+    out = {}
+    for k, v in raw_mapping.items():
+        out[int(k)] = int(v)
+    return out
+
+
+def _resolve_class_names(cfg: dict):
+    data_cfg = cfg.get('data', {})
+    names = data_cfg.get('class_names', None)
+    n_cls = int(data_cfg.get('num_classes', len(CLASS_NAMES)))
+    if names is None:
+        return CLASS_NAMES[:n_cls]
+    names = [str(x) for x in names]
+    if len(names) < n_cls:
+        names = names + [f'class_{i}' for i in range(len(names), n_cls)]
+    return names[:n_cls]
+
+
 def _write_pred_pcd_binary(path: str,
                            pts_xyzi: np.ndarray,
                            pred_train: np.ndarray,
@@ -688,22 +721,37 @@ class InferenceDataset:
         self.use_geo_pt = mc.get('use_geometric_pt_features', False)
         self.pb_continuous_coords = mc.get('pb_continuous_coords', False)
 
+        label_mapping = _normalize_label_mapping(dc.get('label_mapping', None))
+        if label_mapping is None:
+            label_mapping = LABEL_MAPPING
         lut = np.full(65536, 255, dtype=np.int32)
-        for raw, train in LABEL_MAPPING.items():
+        for raw, train in label_mapping.items():
             if raw < 65536:
                 lut[raw] = train
         self._lut = lut
 
-        seqs = {'train': TRAIN_SEQS, 'val': VAL_SEQS, 'test': TEST_SEQS}[split]
+        seqs_cfg_key = {'train': 'train_seqs', 'val': 'val_seqs', 'test': 'test_seqs'}[split]
+        seqs = _parse_csv_seqs(dc.get(seqs_cfg_key, None))
+        if seqs is None:
+            seqs = {'train': TRAIN_SEQS, 'val': VAL_SEQS, 'test': TEST_SEQS}[split]
+
         self.frames = []
         for seq in seqs:
             velo_dir  = os.path.join(root, 'sequences', seq, 'velodyne')
             label_dir = os.path.join(root, 'sequences', seq, 'labels')
+            if not os.path.isdir(velo_dir):
+                print(f'[WARN] missing sequence dir, skip: {velo_dir}')
+                continue
             for b in sorted(os.listdir(velo_dir)):
                 stem = b.replace('.bin', '')
                 entry = {'velo': os.path.join(velo_dir, b), 'seq': seq, 'stem': stem}
-                if split != 'test' and os.path.isdir(label_dir):
-                    entry['label'] = os.path.join(label_dir, stem + '.label')
+                if split != 'test':
+                    label_path = os.path.join(label_dir, stem + '.label')
+                    if os.path.isfile(label_path):
+                        entry['label'] = label_path
+                    else:
+                        # val/train 推理默认要求有标签用于评估
+                        continue
                 self.frames.append(entry)
 
     def __len__(self):
@@ -842,6 +890,7 @@ def _infer_one_frame(models, sample: dict, device: torch.device,
 def run_val(models, cfg, device, knn_cfg, tta_cfg, infer_cfg, crf_cfg=None):
     dc = cfg['data']
     mc = cfg['model']
+    class_names = _resolve_class_names(cfg)
 
     use_tta     = tta_cfg['use_tta']
     tta_fns     = _TTA_FNS[:tta_cfg['tta_augs']]
@@ -992,7 +1041,7 @@ def run_val(models, cfg, device, knn_cfg, tta_cfg, infer_cfg, crf_cfg=None):
     header = f'{"Class":<18}  {"IoU":>6}'
     print(header)
     print('─' * len(header))
-    for name, iou in zip(CLASS_NAMES, per_cls):
+    for name, iou in zip(class_names, per_cls):
         if not np.isnan(iou):
             print(f'  {name:<16}  {iou:>6.2f}')
         else:
@@ -1009,7 +1058,7 @@ def run_val(models, cfg, device, knn_cfg, tta_cfg, infer_cfg, crf_cfg=None):
     hdr = f'{"Class":<18}  {"Prec":>6}  {"Rec":>6}  {"F1":>6}'
     print(hdr)
     print('─' * len(hdr))
-    for name, p_, r_ in zip(CLASS_NAMES, prec, rec):
+    for name, p_, r_ in zip(class_names, prec, rec):
         if np.isnan(p_) and np.isnan(r_):
             print(f'  {name:<16}  {"--":>6}  {"--":>6}  {"--":>6}  (no GT)')
         else:
@@ -1017,7 +1066,7 @@ def run_val(models, cfg, device, knn_cfg, tta_cfg, infer_cfg, crf_cfg=None):
             print(f'  {name:<16}  {p_:>6.2f}  {r_:>6.2f}  {f1:>6.2f}')
 
     # ── 诊断：motorcyclist 混淆行（motorcyclist GT 被预测为哪些类）──
-    moto_idx = CLASS_NAMES.index('motorcyclist') if 'motorcyclist' in CLASS_NAMES else None
+    moto_idx = class_names.index('motorcyclist') if 'motorcyclist' in class_names else None
     if moto_idx is not None:
         print(f'\n{"─"*60}')
         print(f'Confusion row — GT=motorcyclist (idx {moto_idx}):')
@@ -1030,7 +1079,7 @@ def run_val(models, cfg, device, knn_cfg, tta_cfg, infer_cfg, crf_cfg=None):
             for c in order:
                 if row[c] == 0:
                     continue
-                pname = CLASS_NAMES[c] if c < len(CLASS_NAMES) else f'cls{c}'
+                pname = class_names[c] if c < len(class_names) else f'cls{c}'
                 print(f'  {pname:<18}  {int(row[c]):>8}  {row[c]/total*100:>7.2f}')
         else:
             print('  (no motorcyclist GT points in val set)')
