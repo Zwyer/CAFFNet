@@ -278,6 +278,7 @@ def build_probe_loader(
         lasermix_p=cfg_data.get("lasermix_p", 0.0),
         use_surface_normals=cfg_data.get("use_surface_normals", False),
         use_angle_encoding=cfg_data.get("use_angle_encoding", False),
+        use_intensity=cfg_data.get("use_intensity", True),
     )
     return DataLoader(
         ds,
@@ -393,6 +394,7 @@ def main() -> None:
             lasermix_p=dc.get("lasermix_p", 0.0),
             use_surface_normals=dc.get("use_surface_normals", False),
             use_angle_encoding=dc.get("use_angle_encoding", False),
+            use_intensity=dc.get("use_intensity", True),
         )
         loader = DataLoader(
             ds,

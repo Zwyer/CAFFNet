@@ -66,6 +66,7 @@ data:
 
   use_surface_normals: false
   use_angle_encoding: true
+  use_intensity: false # 使用/不使用intensity
 
   low_label_finetune:
     enable: false

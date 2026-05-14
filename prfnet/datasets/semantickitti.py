@@ -252,6 +252,8 @@ class SemanticKITTIDataset(Dataset):
                  # ── 【创新①②】RV 特征增强开关 ────────────────
                  use_surface_normals: bool = False,
                  use_angle_encoding: bool = False,
+                 # 是否使用 intensity（False 时将 intensity 置零，但保持通道维度不变）
+                 use_intensity: bool = True,
                  # 自定义标签映射（raw_label -> train_id）；None 时使用默认 SemanticKITTI 映射
                  label_mapping: Optional[Dict[int, int]] = None,
                  # ── Copy-Paste 实例增强 ────────────────────
@@ -266,6 +268,7 @@ class SemanticKITTIDataset(Dataset):
         self.max_points = max_points
         self.R_max = R_max
         self.rv_H = rv_H
+        self.use_intensity = bool(use_intensity)
         self.require_labels = require_labels and (split != 'test')
         self.label_mapping = (
             {int(k): int(v) for k, v in label_mapping.items()}
@@ -531,11 +534,14 @@ class SemanticKITTIDataset(Dataset):
             pts    = pts[idx_s]
             labels = labels[idx_s]
 
-        intensity = pts[:, 3].copy()
+        pts_out = pts.astype(np.float32, copy=True)
+        if not self.use_intensity:
+            pts_out[:, 3] = 0.0
+        intensity = pts_out[:, 3].copy()
 
         # 生成 Range Image（rv_point_idx 记录每像素对应的点索引，用于像素级 aux 标签）
-        rv_img, rv_point_idx = self.rv_proj.project(pts[:, :3], intensity)
-        rv_coords = self.rv_proj.compute_sample_coords(pts[:, :3])
+        rv_img, rv_point_idx = self.rv_proj.project(pts_out[:, :3], intensity)
+        rv_coords = self.rv_proj.compute_sample_coords(pts_out[:, :3])
 
         # 像素级 Range Image 标签（用于 rv_aux 辅助损失）
         # rv_point_idx[h,w] >= 0 时取该点的语义标签，否则填 255（ignore）
@@ -544,13 +550,13 @@ class SemanticKITTIDataset(Dataset):
         rv_labels_np[valid_pix] = labels[rv_point_idx[valid_pix]]
 
         # 生成 Polar BEV
-        pb_img = self.pb_proj.project(pts[:, :3], intensity)
-        pb_coords = self.pb_proj.compute_sample_coords(pts[:, :3])
+        pb_img = self.pb_proj.project(pts_out[:, :3], intensity)
+        pb_coords = self.pb_proj.compute_sample_coords(pts_out[:, :3])
 
         # 转 Tensor
         rv_img_t    = torch.from_numpy(rv_img)                        # (rv_channels, H, W)
         pb_img_t    = torch.from_numpy(pb_img)                        # (9, H_p, W_p)
-        pts_t       = torch.from_numpy(pts.astype(np.float32))        # (N, 4)
+        pts_t       = torch.from_numpy(pts_out.astype(np.float32, copy=False))  # (N, 4)
         labels_t    = torch.from_numpy(labels.astype(np.int64))       # (N,)
         rv_labels_t = torch.from_numpy(rv_labels_np)                  # (H, W)
 

@@ -52,6 +52,7 @@ data:
   lasermix_p: 0.0
   use_surface_normals: false
   use_angle_encoding: true
+  use_intensity: true
 
   low_label_finetune:
     enable: false

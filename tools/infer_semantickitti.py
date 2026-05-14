@@ -288,7 +288,8 @@ def _prepare_aug(aug_fn, rv_proj: RangeImageProjector,
                  pb_proj: PolarBEVProjector,
                  raw_pts: np.ndarray, R_max: float,
                  use_geo_pt: bool = False,
-                 pb_continuous_coords: bool = False) -> dict:
+                 pb_continuous_coords: bool = False,
+                 use_intensity: bool = True) -> dict:
     """
     CPU 密集型：对 raw_pts 施加变换，重新投影，返回 CPU 张量字典。
     在独立线程中运行，与 GPU 推理流水线并行。
@@ -298,6 +299,9 @@ def _prepare_aug(aug_fn, rv_proj: RangeImageProjector,
     dist = np.linalg.norm(pts[:, :3], axis=1)
     valid = (dist > 0.5) & (dist < R_max)
     pts_v = pts[valid]
+    if not use_intensity:
+        pts_v = pts_v.copy()
+        pts_v[:, 3] = 0.0
     intensity = pts_v[:, 3].copy()
 
     rv_img, _  = rv_proj.project(pts_v[:, :3], intensity)
@@ -720,6 +724,7 @@ class InferenceDataset:
                                         )
         self.use_geo_pt = mc.get('use_geometric_pt_features', False)
         self.pb_continuous_coords = mc.get('pb_continuous_coords', False)
+        self.use_intensity = bool(dc.get('use_intensity', True))
 
         label_mapping = _normalize_label_mapping(dc.get('label_mapping', None))
         if label_mapping is None:
@@ -765,6 +770,9 @@ class InferenceDataset:
         dist       = np.linalg.norm(raw_pts[:, :3], axis=1)
         valid_mask = (dist > 0.5) & (dist < self.R_max)
         pts        = raw_pts[valid_mask]
+        if not self.use_intensity:
+            pts = pts.copy()
+            pts[:, 3] = 0.0
         intensity  = pts[:, 3].copy()
 
         rv_img, _  = self.rv_proj.project(pts[:, :3], intensity)
@@ -798,6 +806,7 @@ class InferenceDataset:
             'raw_N':      raw_N,
             'seq':        entry['seq'],
             'stem':       entry['stem'],
+            'use_intensity': self.use_intensity,
         }
 
 
@@ -846,7 +855,12 @@ def _infer_one_frame(models, sample: dict, device: torch.device,
     future_list = []
     for fn in tta_fns[1:]:
         future_list.append(
-            executor.submit(_prepare_aug, fn, rv_proj, pb_proj, raw_pts, R_max, use_geo_pt, pb_continuous_coords)
+            executor.submit(
+                _prepare_aug,
+                fn, rv_proj, pb_proj, raw_pts, R_max,
+                use_geo_pt, pb_continuous_coords,
+                bool(sample.get('use_intensity', True)),
+            )
         )
 
     rv_img    = sample['rv_img'].unsqueeze(0).to(device)

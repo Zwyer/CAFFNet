@@ -764,6 +764,7 @@ def main(args):
         lasermix_p=dc.get('lasermix_p', 0.5),
         use_surface_normals=_use_normals,
         use_angle_encoding=_use_angle,
+        use_intensity=bool(dc.get('use_intensity', True)),
         copy_paste_bank=cp_bank,
         copy_paste_classes={int(k): v for k, v in cp_cfg.get('classes', {}).items()},
         cp_drop_p_base=cp_cfg.get('drop_p_base', 0.05),
@@ -863,6 +864,7 @@ def main(args):
         max_points=dc['max_points'],
         use_surface_normals=_use_normals,
         use_angle_encoding=_use_angle,
+        use_intensity=bool(dc.get('use_intensity', True)),
     )
 
     train_loader = DataLoader(
