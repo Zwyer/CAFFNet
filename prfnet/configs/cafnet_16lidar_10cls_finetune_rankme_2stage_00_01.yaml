@@ -102,7 +102,7 @@ model:
   rv_in: 9
 
 train:
-  epochs: 120
+  epochs: 300
   seed: 42
   optimizer: adamw
   lr: 2.0e-4
