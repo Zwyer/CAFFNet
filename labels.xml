@@ -1,0 +1,113 @@
+<config>
+  <label>
+    <id>0</id>
+    <name>unlabeled</name>
+    <description>all points with no special label.</description>
+    <color>0 0 0</color>
+    <root>void</root>
+    <macro></macro>
+    <category>unlabeled</category>
+  </label>
+
+  <label>
+    <id>10</id>
+    <name>car</name>
+    <description>Cars, SUVs, vans with a continuous body shape.</description>
+    <color>100 150 245</color>
+    <root>vehicle</root>
+    <macro>vehicle</macro>
+    <category>car</category>
+    <moving>252</moving>
+    <instanceable>true</instanceable>
+  </label>
+
+  <label>
+    <id>40</id>
+    <name>road</name>
+    <description>Drivable road surface.</description>
+    <color>255 0 255</color>
+    <root>ground</root>
+    <macro>flat</macro>
+    <category>road</category>
+  </label>
+
+  <label>
+    <id>50</id>
+    <name>building</name>
+    <description>Building walls, doors, etc.</description>
+    <color>255 200 0</color>
+    <root>structure</root>
+    <macro>structure</macro>
+    <category>building</category>
+  </label>
+
+  <label>
+    <id>51</id>
+    <name>fence</name>
+    <description>Fences, small walls, crash barriers, etc.</description>
+    <color>255 120 50</color>
+    <root>structure</root>
+    <macro>structure</macro>
+    <category>fence</category>
+  </label>
+
+  <label>
+    <id>53</id>
+    <name>curb</name>
+    <description>Raised curb or road edge.</description>
+    <color>180 180 255</color>
+    <root>ground</root>
+    <macro>flat</macro>
+    <category>curb</category>
+  </label>
+
+  <label>
+    <id>70</id>
+    <name>vegetation</name>
+    <description>Trees and other vertically growing vegetation.</description>
+    <color>0 175 0</color>
+    <root>nature</root>
+    <macro></macro>
+    <category>vegetation</category>
+  </label>
+
+  <label>
+    <id>71</id>
+    <name>trunk</name>
+    <description>Tree trunks.</description>
+    <color>135 60 0</color>
+    <root>nature</root>
+    <macro></macro>
+    <category>trunk</category>
+  </label>
+
+  <label>
+    <id>72</id>
+    <name>terrain</name>
+    <description>Grass, soil, and other horizontal natural ground.</description>
+    <color>150 240 80</color>
+    <root>nature</root>
+    <macro></macro>
+    <category>terrain</category>
+  </label>
+
+  <label>
+    <id>80</id>
+    <name>pole</name>
+    <description>Thin vertical support poles.</description>
+    <color>255 240 150</color>
+    <root>object</root>
+    <macro>support</macro>
+    <category>pole</category>
+  </label>
+
+  <label>
+    <id>99</id>
+    <name>other-object</name>
+    <description>Other small objects without a more specific class.</description>
+    <color>50 255 255</color>
+    <root>object</root>
+    <macro>object</macro>
+    <category>other-object</category>
+  </label>
+</config>

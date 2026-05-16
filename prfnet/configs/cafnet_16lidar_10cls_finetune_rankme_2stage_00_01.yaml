@@ -55,19 +55,19 @@ data:
   use_intensity: true
 
   low_label_finetune:
-    enable: false
-    num_frames: 0
+    enable: true
+    num_frames: 200
     seed: 42
     balance_by_seq: true
-    selected_frames_path: selected_frames_select.txt
+    selected_frames_path: ""
     selected_frames_strict: true
     selected_frames_fill_random: false
     dump_indices_path: selected_train_indices.txt
 
   # 可选：验证集抽样（不提供 selected_frames_path 时按 seed 随机抽）
   val_low_label_finetune:
-    enable: false
-    num_frames: 0
+    enable: true
+    num_frames: 100
     seed: 43
     balance_by_seq: true
     selected_frames_path: ""
