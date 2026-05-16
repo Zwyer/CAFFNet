@@ -34,9 +34,9 @@ data:
   fov_down: -16.0
   R_max: 85.0
 
-  batch_size: 8
+  batch_size: 16
   num_workers: 12
-  val_batch_size: 8
+  val_batch_size: 16
   val_num_workers: 12
 
   augment: true
@@ -63,6 +63,17 @@ data:
     selected_frames_strict: true
     selected_frames_fill_random: false
     dump_indices_path: selected_train_indices.txt
+
+  # 可选：验证集抽样（不提供 selected_frames_path 时按 seed 随机抽）
+  val_low_label_finetune:
+    enable: false
+    num_frames: 0
+    seed: 43
+    balance_by_seq: true
+    selected_frames_path: ""
+    selected_frames_strict: false
+    selected_frames_fill_random: true
+    dump_indices_path: selected_val_indices.txt
 
   copy_paste:
     enable: false

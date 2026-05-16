@@ -866,6 +866,89 @@ def main(args):
         use_angle_encoding=_use_angle,
         use_intensity=bool(dc.get('use_intensity', True)),
     )
+    full_val_len = len(val_ds)
+
+    # ── 可选：验证集子集（例如固定 100 帧）───────────────────
+    val_low_cfg = dc.get('val_low_label_finetune', {})
+    vll_enable = bool(val_low_cfg.get('enable', False))
+    vll_frames = int(val_low_cfg.get('num_frames', 0))
+    vll_seed = int(val_low_cfg.get('seed', seed + 1))
+    vll_balance_by_seq = bool(val_low_cfg.get('balance_by_seq', True))
+    vll_dump_path = val_low_cfg.get('dump_indices_path', 'selected_val_indices.txt')
+    vll_selected_path_raw = str(val_low_cfg.get('selected_frames_path', '')).strip()
+    vll_selected_strict = bool(val_low_cfg.get('selected_frames_strict', False))
+    vll_selected_fill_random = bool(val_low_cfg.get('selected_frames_fill_random', True))
+
+    vll_selected_path = ''
+    if vll_selected_path_raw:
+        if os.path.isabs(vll_selected_path_raw):
+            vll_selected_path = vll_selected_path_raw
+        else:
+            cfg_rel = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(args.cfg)), vll_selected_path_raw))
+            cwd_rel = os.path.abspath(vll_selected_path_raw)
+            if os.path.isfile(cwd_rel):
+                vll_selected_path = cwd_rel
+            elif os.path.isfile(cfg_rel):
+                vll_selected_path = cfg_rel
+            else:
+                vll_selected_path = cwd_rel
+
+    if vll_enable and vll_frames > 0:
+        if vll_selected_path:
+            if not os.path.isfile(vll_selected_path):
+                raise FileNotFoundError(
+                    f'Val selected_frames_path not found: {vll_selected_path}'
+                )
+            val_ds, vchosen_idx, vseq_counts, vsel_stats = _build_low_label_subset_from_file(
+                val_ds,
+                list_path=vll_selected_path,
+                subset_frames=vll_frames,
+                subset_seed=vll_seed,
+                strict=vll_selected_strict,
+                fill_random_if_insufficient=vll_selected_fill_random,
+            )
+            logger.info(
+                'Val-subset enabled from selected list: '
+                f'used={len(vchosen_idx)} target={vll_frames} seed={vll_seed} '
+                f'list={vll_selected_path}'
+            )
+            logger.info(
+                'Val selected-list stats: '
+                f'total={vsel_stats["list_total"]} found={vsel_stats["found"]} '
+                f'missing={vsel_stats["missing"]} malformed={vsel_stats["malformed"]} '
+                f'final_used={vsel_stats["final_used"]}'
+            )
+            if vsel_stats["missing"] > 0:
+                logger.info(
+                    'Val selected-list missing examples: ' +
+                    ', '.join(vsel_stats["missing_examples"])
+                )
+        else:
+            val_ds, vchosen_idx, vseq_counts = _build_low_label_subset(
+                val_ds,
+                subset_frames=vll_frames,
+                subset_seed=vll_seed,
+                balance_by_seq=vll_balance_by_seq,
+            )
+            logger.info(
+                f'Val-subset enabled: sampled {len(vchosen_idx)} val frames '
+                f'(seed={vll_seed}, balance_by_seq={vll_balance_by_seq})'
+            )
+        logger.info(
+            'Val-subset seq distribution: ' +
+            ', '.join([f'{k}:{v}' for k, v in sorted(vseq_counts.items())])
+        )
+        if vll_dump_path:
+            vll_dump_abs = os.path.join(exp_dir, vll_dump_path)
+            with open(vll_dump_abs, 'w', encoding='utf-8') as f:
+                for i in vchosen_idx:
+                    frame = val_ds.dataset.frames[int(i)]
+                    velo_path = frame['velo']
+                    stem = os.path.splitext(os.path.basename(velo_path))[0]
+                    f.write(f'{frame["seq"]}/{stem}\tidx={int(i)}\n')
+            logger.info(f'Val-subset frame list saved: {vll_dump_abs}')
+    else:
+        logger.info('Val-subset disabled: using full val split.')
 
     train_loader = DataLoader(
         train_ds, batch_size=dc['batch_size'],
@@ -884,6 +967,9 @@ def main(args):
     writer.add_scalar('data/train_frames', float(len(train_ds)), 0)
     writer.add_scalar('data/train_frames_ratio_to_full',
                       float(len(train_ds)) / max(float(full_train_len), 1.0), 0)
+    writer.add_scalar('data/val_frames', float(len(val_ds)), 0)
+    writer.add_scalar('data/val_frames_ratio_to_full',
+                      float(len(val_ds)) / max(float(full_val_len), 1.0), 0)
 
     # ── 模型 ───────────────────────────────────────────────
     model = PRFNet(
