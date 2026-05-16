@@ -139,7 +139,8 @@ loss:
   use_focal: true
   focal_gamma: 2.0
   label_smoothing: 0.0
-  class_weights: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  # class order: car, road, building, fence, curb, vegetation, trunk, terrain, pole, other-object
+  class_weights: [1.0, 1.0, 1.0, 1.6, 1.4, 1.0, 1.8, 1.0, 1.6, 1.5]
 
 eval:
   use_knn: false
