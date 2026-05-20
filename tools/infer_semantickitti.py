@@ -214,6 +214,41 @@ for t, r in TRAIN_TO_RAW.items():
     _TRAIN2RAW_LUT[t] = r
 
 
+def _build_train2raw_lut_from_cfg(cfg: dict) -> np.ndarray:
+    """
+    构建 test 输出用 train_id -> raw_id LUT。
+    优先使用 cfg.data.label_mapping（raw -> train）反推；
+    若不存在则回退到默认 SemanticKITTI 19 类映射。
+    """
+    data_cfg = cfg.get('data', {})
+    n_cls = int(data_cfg.get('num_classes', 19))
+    label_mapping = _normalize_label_mapping(data_cfg.get('label_mapping', None))
+
+    # default: ignore -> unlabeled raw=0
+    lut = np.zeros(256, dtype=np.uint32)
+    lut[255] = 0
+
+    if not label_mapping:
+        lut[:_TRAIN2RAW_LUT.shape[0]] = _TRAIN2RAW_LUT
+        return lut
+
+    # raw -> train  反推 train -> raw
+    for raw_id, train_id in label_mapping.items():
+        if train_id == 255:
+            continue
+        if train_id < 0 or train_id >= 255:
+            continue
+        # 如遇同 train_id 多 raw_id，保留首次写入（通常不会发生）
+        if lut[train_id] == 0:
+            lut[train_id] = np.uint32(raw_id)
+
+    # 若有类别未被显式映射，置为 0（unlabeled）
+    for t in range(max(0, n_cls)):
+        if lut[t] == 0:
+            lut[t] = 0
+    return lut
+
+
 # ─────────────────────────────────────────────────────────────
 # TTA 变换函数（作用于原始点云 ndarray，in-place）
 # ─────────────────────────────────────────────────────────────
@@ -1112,6 +1147,7 @@ def run_val(models, cfg, device, knn_cfg, tta_cfg, infer_cfg, crf_cfg=None):
 def run_test(models, cfg, device, output_dir, knn_cfg, tta_cfg, infer_cfg):
     dc = cfg['data']
     mc = cfg['model']
+    train2raw_lut = _build_train2raw_lut_from_cfg(cfg)
 
     use_tta     = tta_cfg['use_tta']
     tta_fns     = _TTA_FNS[:tta_cfg['tta_augs']]
@@ -1172,7 +1208,7 @@ def run_test(models, cfg, device, output_dir, knn_cfg, tta_cfg, infer_cfg):
         valid_mask = sample['valid_mask']
         full_train = np.full(raw_N, 255, dtype=np.uint8)
         full_train[valid_mask] = preds.astype(np.uint8)
-        full_raw = _TRAIN2RAW_LUT[full_train].astype(np.uint32)
+        full_raw = train2raw_lut[full_train].astype(np.uint32)
 
         os.makedirs(pred_dir, exist_ok=True)
         full_raw.tofile(out_path)
