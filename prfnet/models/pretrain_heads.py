@@ -352,19 +352,19 @@ class NOMAEPCPPretrainHead(nn.Module):
 
         self.occ_head = nn.Sequential(
             nn.Conv2d(in_c, hidden, 1, bias=False),
-            nn.BatchNorm2d(hidden),
+            nn.BatchNorm2d(hidden, eps=1e-3),
             nn.ReLU6(inplace=True),
             nn.Conv2d(hidden, len(self.occ_scales), 1, bias=True),
         )
         self.center_head_stage1 = nn.Sequential(
             nn.Conv2d(in_c, hidden, 1, bias=False),
-            nn.BatchNorm2d(hidden),
+            nn.BatchNorm2d(hidden, eps=1e-3),
             nn.ReLU6(inplace=True),
             nn.Conv2d(hidden, 3, 1, bias=True),
         )
         self.center_head_stage2 = nn.Sequential(
             nn.Conv2d(in_c + 3, hidden, 1, bias=False),
-            nn.BatchNorm2d(hidden),
+            nn.BatchNorm2d(hidden, eps=1e-3),
             nn.ReLU6(inplace=True),
             nn.Conv2d(hidden, 3, 1, bias=True),
         )

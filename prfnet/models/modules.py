@@ -21,7 +21,7 @@ from typing import List, Tuple
 def conv_bn_relu6(in_c, out_c, k=3, s=1, p=1, groups=1):
     return nn.Sequential(
         nn.Conv2d(in_c, out_c, k, s, p, groups=groups, bias=False),
-        nn.BatchNorm2d(out_c),
+        nn.BatchNorm2d(out_c, eps=1e-3),
         nn.ReLU6(inplace=True),
     )
 
@@ -46,7 +46,7 @@ class InvertedResidual(nn.Module):
         layers += [
             conv_bn_relu6(hidden, hidden, 3, stride, 1, groups=hidden),  # DWConv
             nn.Conv2d(hidden, out_c, 1, 1, 0, bias=False),               # PW (线性)
-            nn.BatchNorm2d(out_c),
+            nn.BatchNorm2d(out_c, eps=1e-3),
         ]
         self.conv = nn.Sequential(*layers)
 
@@ -68,14 +68,14 @@ class ASPP(nn.Module):
             nn.Sequential(
                 nn.Conv2d(in_c, in_c, 3, 1, r, dilation=r, groups=in_c, bias=False),
                 nn.Conv2d(in_c, out_c // len(rates), 1, bias=False),
-                nn.BatchNorm2d(out_c // len(rates)),
+                nn.BatchNorm2d(out_c // len(rates), eps=1e-3),
                 nn.ReLU6(inplace=True),
             )
             for r in rates
         ])
         self.fuse = nn.Sequential(
             nn.Conv2d(out_c, out_c, 1, bias=False),
-            nn.BatchNorm2d(out_c),
+            nn.BatchNorm2d(out_c, eps=1e-3),
             nn.ReLU6(inplace=True),
         )
 
@@ -140,7 +140,7 @@ class AAFF(nn.Module):
     通过压缩非共享维度 → Conv1d 门控，实现跨视图特征增强。
 
     所有算子均为 RK3588 RKNN NPU 原生支持：
-        AvgPool2d、MaxPool2d、Concat、Conv2d(kernel=(1,k))、Sigmoid、Mul、Add
+        AvgPool2d、MaxPool2d、Concat、Conv2d(kernel=(1,k))、Hardsigmoid、Mul、Add
 
     Args:
         channels: 两个分支的公共通道数 C
@@ -153,17 +153,17 @@ class AAFF(nn.Module):
         self.aggregate = nn.Sequential(
             # 用 kernel=(1,3) 的 Conv2d 实现 Conv1d（W 方向）
             nn.Conv2d(channels * 4, reduced, kernel_size=(1, 3), padding=(0, 1), bias=False),
-            nn.BatchNorm2d(reduced),
+            nn.BatchNorm2d(reduced, eps=1e-3),
             nn.ReLU6(inplace=True),
         )
         # 分别生成 RV 和 PB 的方位角门控
         self.gate_rv = nn.Sequential(
             nn.Conv2d(reduced, channels, kernel_size=(1, 1), bias=True),
-            nn.Sigmoid(),
+            nn.Hardsigmoid(),
         )
         self.gate_pb = nn.Sequential(
             nn.Conv2d(reduced, channels, kernel_size=(1, 1), bias=True),
-            nn.Sigmoid(),
+            nn.Hardsigmoid(),
         )
 
     def forward(self,
@@ -276,17 +276,17 @@ class DepthStratifiedAAFF(nn.Module):
         self.aggregate = nn.Sequential(
             nn.Conv2d(5 * K * channels, reduced,
                       kernel_size=(1, 3), padding=(0, 1), bias=False),
-            nn.BatchNorm2d(reduced),
+            nn.BatchNorm2d(reduced, eps=1e-3),
             nn.ReLU6(inplace=True),
         )
         # 每个视图生成 K 个距离带各自的门控，每带 C 通道
         self.gate_rv = nn.Sequential(
             nn.Conv2d(reduced, channels * K, kernel_size=(1, 1), bias=True),
-            nn.Sigmoid(),
+            nn.Hardsigmoid(),
         )
         self.gate_pb = nn.Sequential(
             nn.Conv2d(reduced, channels * K, kernel_size=(1, 1), bias=True),
-            nn.Sigmoid(),
+            nn.Hardsigmoid(),
         )
 
     @staticmethod
@@ -451,13 +451,13 @@ class PointSampleAggregator(nn.Module):
         # 点自身特征编码（x,y,z,intensity → 32d）
         self.pt_enc = nn.Sequential(
             nn.Linear(pt_dim, 32, bias=False),
-            nn.BatchNorm1d(32),
+            nn.BatchNorm1d(32, eps=1e-3),
             nn.ReLU6(inplace=True),
         )
         in_dim = rv_c + pb_c + 32
         self.head = nn.Sequential(
             nn.Linear(in_dim, 128, bias=False),
-            nn.BatchNorm1d(128),
+            nn.BatchNorm1d(128, eps=1e-3),
             nn.ReLU6(inplace=True),
             nn.Dropout(head_dropout),
             nn.Linear(128, num_classes),
@@ -628,7 +628,7 @@ class AuxHead(nn.Module):
         super().__init__()
         self.head = nn.Sequential(
             nn.Conv2d(in_c, in_c // 2, 1, bias=False),
-            nn.BatchNorm2d(in_c // 2),
+            nn.BatchNorm2d(in_c // 2, eps=1e-3),
             nn.ReLU6(inplace=True),
             nn.Conv2d(in_c // 2, num_classes, 1),
         )
