@@ -240,30 +240,6 @@ class RangeImageProjector:
         coords = np.stack([u, v], axis=-1)  # (N, 2)
         return coords
 
-    def compute_pixel_coords(self, points: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        计算每个点在 Range Image 上的离散像素坐标 (row, col)。
-
-        Args:
-            points: (N, 3) float32
-
-        Returns:
-            row: (N,) int32
-            col: (N,) int32
-        """
-        x, y, z = points[:, 0], points[:, 1], points[:, 2]
-        r = np.sqrt(x**2 + y**2 + z**2).clip(1e-5)
-
-        phi   = np.arcsin(np.clip(z / r, -1.0, 1.0))
-        theta = np.arctan2(y, x)
-
-        row_f = (self.fov_up - phi) / self.fov * (self.H - 1)
-        col_f = (theta + np.pi) / (2 * np.pi) * (self.W - 1)
-
-        row = np.clip(np.round(row_f).astype(np.int32), 0, self.H - 1)
-        col = np.clip(np.round(col_f).astype(np.int32), 0, self.W - 1)
-        return row, col
-
 
 # ─────────────────────────────────────────────────────────────
 # Polar BEV 投影
