@@ -1,0 +1,21 @@
+{
+  "configuration": {
+    "images-folder": "",
+    "internal-folder": ""
+  },
+  "sets-of-classes": [
+    {
+      "name": "16lidar-7class",
+      "objects": [
+        {"label": "VOID", "color": "#CFCFCF"},
+        {"label": "Road", "color": "#804080", "icon": "Road"},
+        {"label": "Curb", "color": "#FAC800", "icon": "SignCaution"},
+        {"label": "Vegetation", "color": "#6B8E23", "icon": "PineTree"},
+        {"label": "Car", "color": "#0000E8", "icon": "Car"},
+        {"label": "Bicycle", "color": "#770B20", "icon": "Bike"},
+        {"label": "Person", "color": "#DC143C", "icon": "Walk"},
+        {"label": "Low Obstacle", "color": "#FF8C00", "icon": "Anchor"}
+      ]
+    }
+  ]
+}

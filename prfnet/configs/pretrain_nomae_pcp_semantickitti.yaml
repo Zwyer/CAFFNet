@@ -1,0 +1,95 @@
+data:
+  root: /root/autodl-tmp/semantickitti/dataset/
+  rv_H: 64
+  rv_W: 1024
+  pb_H: 640
+  pb_W: 1024
+  max_points: 131072
+  fov_up: 2.0
+  fov_down: -24.8
+  R_max: 85.0
+  batch_size: 2
+  num_workers: 12
+  augment: true
+  use_polarmix: false
+  use_lasermix: false
+  rotate: true
+  flip: true
+  scale_min: 0.95
+  scale_max: 1.05
+  drop_p: 0.05
+  polarmix_p: 0.0
+  polarmix_sectors: 8
+  lasermix_p: 0.0
+  use_surface_normals: true
+  use_angle_encoding: true
+
+model:
+  pb_in: 9
+  enc_channels: [96, 192, 384, 384]
+  dec_out_c: 64
+  expand_ratios: [2, 4, 6, 6]
+  rv_strides: [[1,2],[2,2],[2,2],[2,2]]
+  pb_strides: [[2,2],[2,2],[2,2],[2,2]]
+  aspp_rates: [1, 3, 6, 9]
+  use_ds_aaff: true
+  ds_aaff_K: 4
+  head_dropout: 0.1
+  use_vcg: false
+  use_proto: false
+  proto_dim: 64
+
+pretrain:
+  # 训练轮次与优化器
+  epochs: 10
+  seed: 42
+  lr: 8.0e-4
+  weight_decay: 1.0e-4
+  grad_clip: 10.0
+  amp: true
+  scheduler: cosine
+  eta_min: 1.0e-6
+
+  # 基础 mask 比例（关闭 curriculum 时生效）
+  rv_mask_ratio: 0.70
+  pb_mask_ratio: 0.70
+
+  # 预训练损失权重
+  lambda_occ: 1.0
+  lambda_pcp: 1.0
+  log_interval: 20
+
+  # -------- Phase A: mask curriculum + 早停 --------
+  mask_curriculum_enable: true
+  mask_curriculum_warmup_ratio: 0.20
+  rv_mask_ratio_start: 0.70
+  rv_mask_ratio_end: 0.92
+  pb_mask_ratio_start: 0.70
+  pb_mask_ratio_end: 0.92
+
+  early_stop_enable: true
+  early_stop_window: 200
+  early_stop_occ_thr: 1.0e-3
+  early_stop_pcp_thr: 1.0e-3
+  early_stop_gnorm_thr: 0.05
+  early_stop_patience_steps: 600
+
+  # -------- Phase B/C: 泄漏捷径修复 --------
+  input_masking_enable: true
+  input_masking_mode: zero    # zero | token
+  informative_occ_only: true
+  pcp_stopgrad_replace: true
+
+  # -------- Phase D: OCC 损失与 mask 采样约束 --------
+  occ_scales: [1, 3, 5]
+  occ_loss_type: bce_pos_weight  # bce | bce_pos_weight | focal
+  occ_pos_weight: 5.0
+  occ_focal_gamma: 2.0
+
+  mask_pos_ratio_control_enable: true
+  mask_pos_ratio_min: 0.08
+  mask_pos_ratio_max: 0.50
+  mask_resample_max_tries: 5
+
+log:
+  save_dir: runs/prfnet_pretrain_nomae_pcp

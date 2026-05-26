@@ -12,6 +12,10 @@ from .modules import (
     LightEncoder, LightDecoder, AAFF, DepthStratifiedAAFF,
     PointSampleAggregator, AuxHead, conv_bn_relu6,
 )
+from .pretrain_heads import (
+    NOMAEPCPPretrainHead,
+    build_mask_with_pos_ratio_control,
+)
 
 
 class PRFNet(nn.Module):
@@ -55,6 +59,7 @@ class PRFNet(nn.Module):
         super().__init__()
         self.num_classes = num_classes
         self.rv_in = rv_in   # 保存供 export_onnx 使用，避免硬编码通道数
+        self.pb_in = pb_in
 
         # ── 双分支 stem（输出同时作为 decoder 最终跳连接）─────
         # LightEncoder 无内部 stem，避免双重 stem
@@ -101,6 +106,12 @@ class PRFNet(nn.Module):
         # ── 辅助预测头（训练时使用，仅 RV 分支——可直接得到像素级 GT）
         self.rv_aux = AuxHead(dec_out_c, num_classes)
         # pb_aux 已移除：Polar BEV 无直接像素→点映射，难以生成像素级 GT
+
+        # ── 预训练头（NOMAE + PCP，训练期可选启用）──────────────
+        self.pretrain_head_rv = NOMAEPCPPretrainHead(dec_out_c)
+        self.pretrain_head_pb = NOMAEPCPPretrainHead(dec_out_c)
+        self.rv_mask_token = nn.Parameter(torch.zeros(1, rv_in, 1, 1))
+        self.pb_mask_token = nn.Parameter(torch.zeros(1, pb_in, 1, 1))
 
     # ─────────────────────────────────────────────────────────
 
@@ -160,6 +171,293 @@ class PRFNet(nn.Module):
             result['rv_aux'] = self.rv_aux(rv_out)  # (B, num_classes, H_rv, W)
 
         return result
+
+    # ─────────────────────────────────────────────────────────
+    # Cross-view consistency helper
+    # ─────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _cross_view_consistency_loss(
+        rv_out: torch.Tensor,   # (B, C, H_rv, W)
+        pb_out: torch.Tensor,   # (B, C, H_pb, W)
+        rv_mask: torch.Tensor,  # (B, 1, H_rv, W)
+        pb_mask: torch.Tensor,  # (B, 1, H_pb, W)
+        only_visible: bool = True,
+        stop_grad: bool = False,
+    ) -> torch.Tensor:
+        """
+        Cosine-distance loss between azimuth-column–averaged features of RV and PB.
+
+        Both views share the W (azimuth) dimension. After compressing H we get
+        per-column descriptors (B, C, W) that should be mutually consistent for the
+        same scene content observed from different geometric projections.
+
+        only_visible: only compute loss on columns where both views are > 30% unmasked.
+        stop_grad:    if True, stop gradient on the PB branch (asymmetric alignment).
+        """
+        rv_col = rv_out.mean(dim=2)   # (B, C, W)
+        pb_col = pb_out.mean(dim=2)   # (B, C, W)
+
+        if only_visible:
+            rv_vis = (1.0 - rv_mask).squeeze(1).mean(dim=1)   # (B, W)
+            pb_vis = (1.0 - pb_mask).squeeze(1).mean(dim=1)   # (B, W)
+            col_weight = ((rv_vis > 0.3) & (pb_vis > 0.3)).float()
+        else:
+            col_weight = torch.ones(rv_out.shape[0], rv_out.shape[3], device=rv_out.device)
+
+        rv_n = F.normalize(rv_col, dim=1)
+        pb_target = pb_col.detach() if stop_grad else pb_col
+        pb_n = F.normalize(pb_target, dim=1)
+
+        sim = (rv_n * pb_n).sum(dim=1)          # (B, W) cosine similarity
+        loss_map = 1.0 - sim                     # cosine distance in [0, 2]
+
+        n = col_weight.sum().clamp(min=1.0)
+        return (loss_map * col_weight).sum() / n
+
+    def forward_pretrain(
+        self,
+        rv_img: torch.Tensor,
+        pb_img: torch.Tensor,
+        rv_mask_ratio: float = 0.7,
+        pb_mask_ratio: float = 0.7,
+        input_masking_enable: bool = True,
+        input_masking_mode: str = "zero",
+        mask_strategy: str = "mixed",
+        rv_band_axis: str = "row",
+        pb_band_axis: str = "col",
+        mask_mix_random: float = 0.5,
+        mask_mix_block: float = 0.3,
+        mask_mix_band: float = 0.2,
+        mask_mix_hmg: float = 0.0,
+        block_h_min: int = 4,
+        block_h_max: int = 16,
+        block_w_min: int = 16,
+        block_w_max: int = 64,
+        hmg_coarse_stride: int = 8,
+        hmg_fine_extra_ratio: float = 0.05,
+        mask_pos_ratio_control_enable: bool = False,
+        mask_pos_ratio_min: float = 0.08,
+        mask_pos_ratio_max: float = 0.50,
+        mask_resample_max_tries: int = 5,
+        occ_scales: Optional[List[int]] = None,
+        occ_loss_type: str = "bce_pos_weight",
+        occ_pos_weight: float = 5.0,
+        occ_pos_weight_adaptive: bool = False,
+        occ_pos_weight_min: float = 1.0,
+        occ_pos_weight_max: float = 12.0,
+        occ_pos_weight_ema_decay: float = 0.95,
+        occ_focal_gamma: float = 2.0,
+        pcp_stopgrad_replace: bool = True,
+        informative_occ_only: bool = True,
+        pcp_informative_only: bool = True,
+        pcp_pos_weight: float = 1.0,
+        pcp_near_range_max: float = 10.0,
+        pcp_near_weight: float = 1.5,
+        neighbor_sup_only_visible: bool = True,
+        pcp_residual_center: bool = True,
+        pcp_far_only: bool = False,
+        cross_view_consistency_enable: bool = False,
+        lambda_cv: float = 0.1,
+        cv_stop_grad: bool = False,
+        cv_only_visible: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Self-supervised pretraining forward.
+        - NOMAE: occupancy reconstruction on masked cells.
+        - PCP: masked center regression.
+        - Cross-view consistency: cosine alignment between RV and PB azimuth columns.
+
+        Returns dict with losses and diagnostics.
+        """
+        # Targets from original inputs.
+        rv_occ_tgt = (rv_img[:, 3:4] > 0).float()
+        pb_occ_tgt = pb_img[:, 8:9].float()
+        rv_center_tgt = rv_img[:, 0:3]
+        pb_center_tgt = pb_img[:, 0:3]
+
+        # Build masks (optionally occupancy-aware).
+        rv_mask, rv_resample = build_mask_with_pos_ratio_control(
+            rv_img,
+            rv_occ_tgt,
+            rv_mask_ratio,
+            strategy=mask_strategy,
+            band_axis=rv_band_axis,
+            mix_random=mask_mix_random,
+            mix_block=mask_mix_block,
+            mix_band=mask_mix_band,
+            mix_hmg=mask_mix_hmg,
+            block_h_min=block_h_min,
+            block_h_max=block_h_max,
+            block_w_min=block_w_min,
+            block_w_max=block_w_max,
+            hmg_coarse_stride=hmg_coarse_stride,
+            hmg_fine_extra_ratio=hmg_fine_extra_ratio,
+            enable_control=mask_pos_ratio_control_enable,
+            min_pos_ratio=mask_pos_ratio_min,
+            max_pos_ratio=mask_pos_ratio_max,
+            max_tries=mask_resample_max_tries,
+        )
+        pb_mask, pb_resample = build_mask_with_pos_ratio_control(
+            pb_img,
+            pb_occ_tgt,
+            pb_mask_ratio,
+            strategy=mask_strategy,
+            band_axis=pb_band_axis,
+            mix_random=mask_mix_random,
+            mix_block=mask_mix_block,
+            mix_band=mask_mix_band,
+            mix_hmg=mask_mix_hmg,
+            block_h_min=block_h_min,
+            block_h_max=block_h_max,
+            block_w_min=block_w_min,
+            block_w_max=block_w_max,
+            hmg_coarse_stride=hmg_coarse_stride,
+            hmg_fine_extra_ratio=hmg_fine_extra_ratio,
+            enable_control=mask_pos_ratio_control_enable,
+            min_pos_ratio=mask_pos_ratio_min,
+            max_pos_ratio=mask_pos_ratio_max,
+            max_tries=mask_resample_max_tries,
+        )
+
+        # Input-level masking to block leakage shortcuts.
+        if input_masking_enable:
+            mode = str(input_masking_mode).lower()
+            if mode == "zero":
+                rv_img_in = rv_img * (1.0 - rv_mask)
+                pb_img_in = pb_img * (1.0 - pb_mask)
+            elif mode == "token":
+                rv_tok = self.rv_mask_token.expand(rv_img.shape[0], -1, rv_img.shape[2], rv_img.shape[3])
+                pb_tok = self.pb_mask_token.expand(pb_img.shape[0], -1, pb_img.shape[2], pb_img.shape[3])
+                rv_img_in = rv_img * (1.0 - rv_mask) + rv_tok * rv_mask
+                pb_img_in = pb_img * (1.0 - pb_mask) + pb_tok * pb_mask
+            else:
+                # Fallback to zero-mask for unsupported modes.
+                rv_img_in = rv_img * (1.0 - rv_mask)
+                pb_img_in = pb_img * (1.0 - pb_mask)
+        else:
+            rv_img_in = rv_img
+            pb_img_in = pb_img
+
+        fused_rv, fused_pb, rv_stem, pb_stem = self._encode(rv_img_in, pb_img_in)
+        rv_out = self.rv_dec(fused_rv, rv_stem)   # (B, dec_out_c, H_rv, W)
+        pb_out = self.pb_dec(fused_pb, pb_stem)   # (B, dec_out_c, H_pb, W)
+
+        # Sync pretrain head options dynamically from config.
+        if occ_scales is not None and len(occ_scales) == len(self.pretrain_head_rv.occ_scales):
+            self.pretrain_head_rv.occ_scales = [int(max(1, s)) for s in occ_scales]
+            self.pretrain_head_pb.occ_scales = [int(max(1, s)) for s in occ_scales]
+        self.pretrain_head_rv.occ_loss_type = str(occ_loss_type).lower()
+        self.pretrain_head_pb.occ_loss_type = str(occ_loss_type).lower()
+        self.pretrain_head_rv.occ_pos_weight = float(max(1e-6, occ_pos_weight))
+        self.pretrain_head_pb.occ_pos_weight = float(max(1e-6, occ_pos_weight))
+        self.pretrain_head_rv.occ_pos_weight_adaptive = bool(occ_pos_weight_adaptive)
+        self.pretrain_head_pb.occ_pos_weight_adaptive = bool(occ_pos_weight_adaptive)
+        self.pretrain_head_rv.occ_pos_weight_min = float(max(1e-6, occ_pos_weight_min))
+        self.pretrain_head_pb.occ_pos_weight_min = float(max(1e-6, occ_pos_weight_min))
+        self.pretrain_head_rv.occ_pos_weight_max = float(max(1e-6, occ_pos_weight_max))
+        self.pretrain_head_pb.occ_pos_weight_max = float(max(1e-6, occ_pos_weight_max))
+        self.pretrain_head_rv.occ_pos_weight_ema_decay = float(max(0.0, min(0.9999, occ_pos_weight_ema_decay)))
+        self.pretrain_head_pb.occ_pos_weight_ema_decay = float(max(0.0, min(0.9999, occ_pos_weight_ema_decay)))
+        self.pretrain_head_rv.occ_focal_gamma = float(max(0.0, occ_focal_gamma))
+        self.pretrain_head_pb.occ_focal_gamma = float(max(0.0, occ_focal_gamma))
+        self.pretrain_head_rv.pcp_stopgrad_replace = bool(pcp_stopgrad_replace)
+        self.pretrain_head_pb.pcp_stopgrad_replace = bool(pcp_stopgrad_replace)
+        self.pretrain_head_rv.pcp_pos_weight = float(max(1e-6, pcp_pos_weight))
+        self.pretrain_head_pb.pcp_pos_weight = float(max(1e-6, pcp_pos_weight))
+        self.pretrain_head_rv.pcp_near_range_max = float(max(1e-6, pcp_near_range_max))
+        self.pretrain_head_pb.pcp_near_range_max = float(max(1e-6, pcp_near_range_max))
+        self.pretrain_head_rv.pcp_near_weight = float(max(1.0, pcp_near_weight))
+        self.pretrain_head_pb.pcp_near_weight = float(max(1.0, pcp_near_weight))
+        self.pretrain_head_rv.pcp_residual_center = bool(pcp_residual_center)
+        self.pretrain_head_pb.pcp_residual_center = bool(pcp_residual_center)
+        self.pretrain_head_rv.pcp_far_only = bool(pcp_far_only)
+        self.pretrain_head_pb.pcp_far_only = bool(pcp_far_only)
+
+        rv_ret = self.pretrain_head_rv(
+            rv_out, rv_mask, rv_occ_tgt, rv_center_tgt,
+            informative_only=informative_occ_only,
+            pcp_informative_only=pcp_informative_only,
+            neighbor_sup_only_visible=neighbor_sup_only_visible,
+            pcp_residual_center=pcp_residual_center,
+            pcp_far_only=pcp_far_only,
+        )
+        pb_ret = self.pretrain_head_pb(
+            pb_out, pb_mask, pb_occ_tgt, pb_center_tgt,
+            informative_only=informative_occ_only,
+            pcp_informative_only=pcp_informative_only,
+            neighbor_sup_only_visible=neighbor_sup_only_visible,
+            pcp_residual_center=pcp_residual_center,
+            pcp_far_only=pcp_far_only,
+        )
+
+        out = {
+            "loss_occ_rv": rv_ret["loss_occ"],
+            "loss_occ_pb": pb_ret["loss_occ"],
+            "loss_pcp_rv": rv_ret["loss_pcp"],
+            "loss_pcp_pb": pb_ret["loss_pcp"],
+            "rv_mask_ratio": rv_mask.mean().detach(),
+            "pb_mask_ratio": pb_mask.mean().detach(),
+            "rv_masked_pos_ratio": rv_ret["masked_pos_ratio"],
+            "pb_masked_pos_ratio": pb_ret["masked_pos_ratio"],
+            "rv_occ_effective_ratio": rv_ret["occ_effective_ratio"],
+            "pb_occ_effective_ratio": pb_ret["occ_effective_ratio"],
+            "rv_mask_resample": rv_resample.detach(),
+            "pb_mask_resample": pb_resample.detach(),
+        }
+
+        # Cross-view consistency loss (RV ↔ PB azimuth column alignment)
+        if cross_view_consistency_enable:
+            loss_cv = self._cross_view_consistency_loss(
+                rv_out, pb_out, rv_mask, pb_mask,
+                only_visible=cv_only_visible,
+                stop_grad=cv_stop_grad,
+            )
+            out["loss_cv"] = loss_cv
+
+        return out
+
+    @torch.no_grad()
+    def extract_pretrain_point_features(
+        self,
+        rv_img: torch.Tensor,
+        pb_img: torch.Tensor,
+        rv_coords: torch.Tensor,
+        pb_coords: torch.Tensor,
+        points: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Extract point-wise fused features (before classifier head) for probe eval.
+        Returns: (B, N, rv_c + pb_c + 32)
+        """
+        was_training = self.training
+        self.eval()
+        fused_rv, fused_pb, rv_stem, pb_stem = self._encode(rv_img, pb_img)
+        rv_out = self.rv_dec(fused_rv, rv_stem)
+        pb_out = self.pb_dec(fused_pb, pb_stem)
+
+        rv_feat = F.grid_sample(rv_out, rv_coords, mode='bilinear',
+                                align_corners=False, padding_mode='border')
+        rv_feat = rv_feat.squeeze(-1).permute(0, 2, 1)  # (B,N,C)
+
+        pb_feat = F.grid_sample(pb_out, pb_coords, mode='bilinear',
+                                align_corners=False, padding_mode='border')
+        pb_feat = pb_feat.squeeze(-1).permute(0, 2, 1)  # (B,N,C)
+
+        B, N, _ = points.shape
+        _pt_dtype = points.dtype
+        _xyz = points[..., :3].float()
+        _intensity = points[..., 3:4]
+        _r = _xyz.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        _theta = torch.asin((_xyz[..., 2:3] / _r).clamp(-1.0 + 1e-6, 1.0 - 1e-6))
+        _phi = torch.atan2(_xyz[..., 1:2], _xyz[..., 0:1])
+        _pt_input = torch.cat([_r, _theta, _phi, _intensity.float()], dim=-1).to(_pt_dtype)
+        pt_feat = self.aggregator.pt_enc(_pt_input.reshape(B * N, -1)).reshape(B, N, 32)
+
+        feat = torch.cat([rv_feat, pb_feat, pt_feat], dim=-1)
+        if was_training:
+            self.train()
+        return feat
 
     # ─────────────────────────────────────────────────────────
     # RKNN 导出辅助
