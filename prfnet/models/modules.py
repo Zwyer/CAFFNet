@@ -139,8 +139,8 @@ class AAFF(nn.Module):
     利用 Range Image 与 Polar BEV 共享的方位角维度 (W 轴)，
     通过压缩非共享维度 → Conv1d 门控，实现跨视图特征增强。
 
-    所有算子均为 RK3588 RKNN NPU 原生支持（FP16 量化友好）：
-        AvgPool2d、MaxPool2d、Concat、Conv2d(kernel=(1,k))、HardSigmoid、Mul、Add
+    所有算子均为 RK3588 RKNN NPU 原生支持：
+        AvgPool2d、MaxPool2d、Concat、Conv2d(kernel=(1,k))、Sigmoid、Mul、Add
 
     Args:
         channels: 两个分支的公共通道数 C
@@ -156,14 +156,14 @@ class AAFF(nn.Module):
             nn.BatchNorm2d(reduced),
             nn.ReLU6(inplace=True),
         )
-        # 分别生成 RV 和 PB 的方位角门控（HardSigmoid 替代 Sigmoid，FP16 友好）
+        # 分别生成 RV 和 PB 的方位角门控
         self.gate_rv = nn.Sequential(
             nn.Conv2d(reduced, channels, kernel_size=(1, 1), bias=True),
-            nn.Hardsigmoid(),
+            nn.Sigmoid(),
         )
         self.gate_pb = nn.Sequential(
             nn.Conv2d(reduced, channels, kernel_size=(1, 1), bias=True),
-            nn.Hardsigmoid(),
+            nn.Sigmoid(),
         )
 
     def forward(self,
@@ -194,9 +194,9 @@ class AAFF(nn.Module):
         gate_rv = self.gate_rv(ctx)
         gate_pb = self.gate_pb(ctx)
 
-        # Step 5: 广播乘以原特征（含残差恒等通路）
-        f_rv_out = f_rv * (1.0 + gate_rv)
-        f_pb_out = f_pb * (1.0 + gate_pb)
+        # Step 5: 广播乘以原特征 + 残差
+        f_rv_out = f_rv * gate_rv + f_rv
+        f_pb_out = f_pb * gate_pb + f_pb
 
         return f_rv_out, f_pb_out
 
@@ -279,14 +279,14 @@ class DepthStratifiedAAFF(nn.Module):
             nn.BatchNorm2d(reduced),
             nn.ReLU6(inplace=True),
         )
-        # 每个视图生成 K 个距离带各自的门控，每带 C 通道（HardSigmoid，FP16 友好）
+        # 每个视图生成 K 个距离带各自的门控，每带 C 通道
         self.gate_rv = nn.Sequential(
             nn.Conv2d(reduced, channels * K, kernel_size=(1, 1), bias=True),
-            nn.Hardsigmoid(),
+            nn.Sigmoid(),
         )
         self.gate_pb = nn.Sequential(
             nn.Conv2d(reduced, channels * K, kernel_size=(1, 1), bias=True),
-            nn.Hardsigmoid(),
+            nn.Sigmoid(),
         )
 
     @staticmethod
@@ -320,7 +320,7 @@ class DepthStratifiedAAFF(nn.Module):
         K = self.K
         gate_list = gates.chunk(K, dim=1)          # K × (B, C, 1, W)
         modulated = [
-            feat[:, :, s:e, :] * (1.0 + gate_list[k])
+            feat[:, :, s:e, :] * gate_list[k] + feat[:, :, s:e, :]
             for k, (s, e) in enumerate(bands)
         ]
         # recon_order 将 near→far 顺序映射回 top→bottom（行号升序）

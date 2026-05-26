@@ -14,13 +14,12 @@ import logging
 import shutil
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List, Tuple
 
 import yaml
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torch.optim.swa_utils import AveragedModel
 
@@ -103,415 +102,6 @@ class IoUMetric:
     def miou(self) -> float:
         iou = self.per_class_iou()
         return float(np.nanmean(iou))
-
-
-def _batch_class_hist(labels: torch.Tensor,
-                      num_classes: int,
-                      ignore_index: int) -> np.ndarray:
-    """统计一个 batch 的类别直方图（忽略 ignore_index）。"""
-    valid = labels != ignore_index
-    if not valid.any():
-        return np.zeros(num_classes, dtype=np.float64)
-    hist = torch.bincount(labels[valid].view(-1), minlength=num_classes)
-    return hist.detach().cpu().numpy().astype(np.float64)
-
-
-def _build_low_label_subset(dataset: SemanticKITTIDataset,
-                            subset_frames: int,
-                            subset_seed: int,
-                            balance_by_seq: bool = True):
-    """
-    从 train split 采样固定帧数，构造低标注子集（100/200 帧等）。
-    返回：
-      subset_ds:   torch.utils.data.Subset
-      chosen_idx:  选中的原始帧索引（升序）
-      seq_counts:  各序列命中帧数
-    """
-    total = len(dataset)
-    if subset_frames <= 0 or subset_frames >= total:
-        all_idx = np.arange(total, dtype=np.int64)
-        seq_counts = {}
-        for i in all_idx.tolist():
-            seq = dataset.frames[i]['seq']
-            seq_counts[seq] = seq_counts.get(seq, 0) + 1
-        return Subset(dataset, all_idx.tolist()), all_idx.tolist(), seq_counts
-
-    rng = np.random.default_rng(subset_seed)
-
-    if not balance_by_seq:
-        chosen = np.sort(rng.choice(total, size=subset_frames, replace=False)).astype(np.int64)
-    else:
-        seq_to_idx = {}
-        for i, frame in enumerate(dataset.frames):
-            seq_to_idx.setdefault(frame['seq'], []).append(i)
-        seqs = sorted(seq_to_idx.keys())
-
-        # 按序列平均分配，再按剩余容量补齐
-        base = subset_frames // len(seqs)
-        rem = subset_frames % len(seqs)
-        alloc = {s: base for s in seqs}
-        for s in seqs[:rem]:
-            alloc[s] += 1
-
-        chosen_list = []
-        spill = 0
-        for s in seqs:
-            idxs = np.asarray(seq_to_idx[s], dtype=np.int64)
-            want = alloc[s]
-            take = min(want, len(idxs))
-            if take > 0:
-                pick = rng.choice(idxs, size=take, replace=False)
-                chosen_list.extend(pick.tolist())
-            spill += (want - take)
-
-        if spill > 0:
-            chosen_set = set(chosen_list)
-            pool = np.asarray([i for i in range(total) if i not in chosen_set], dtype=np.int64)
-            if len(pool) > 0:
-                extra_take = min(spill, len(pool))
-                extra = rng.choice(pool, size=extra_take, replace=False)
-                chosen_list.extend(extra.tolist())
-
-        chosen = np.sort(np.asarray(chosen_list, dtype=np.int64))
-        # 极端情况下若不足（例如 total<subset_frames，理论上前面已拦截），做保护
-        if len(chosen) < subset_frames:
-            remain_pool = np.asarray([i for i in range(total) if i not in set(chosen.tolist())], dtype=np.int64)
-            need = min(subset_frames - len(chosen), len(remain_pool))
-            if need > 0:
-                more = rng.choice(remain_pool, size=need, replace=False)
-                chosen = np.sort(np.concatenate([chosen, more.astype(np.int64)], axis=0))
-        if len(chosen) > subset_frames:
-            chosen = np.sort(rng.choice(chosen, size=subset_frames, replace=False)).astype(np.int64)
-
-    seq_counts = {}
-    for i in chosen.tolist():
-        seq = dataset.frames[int(i)]['seq']
-        seq_counts[seq] = seq_counts.get(seq, 0) + 1
-
-    return Subset(dataset, chosen.tolist()), chosen.tolist(), seq_counts
-
-
-def _frame_key_from_frame(frame: dict) -> str:
-    seq = str(frame["seq"])
-    stem = os.path.splitext(os.path.basename(frame["velo"]))[0]
-    return f"{seq}/{stem}"
-
-
-def _parse_csv_seqs(value):
-    if value is None:
-        return None
-    if isinstance(value, str):
-        items = [x.strip() for x in value.split(",") if x.strip()]
-        return items if items else None
-    if isinstance(value, (list, tuple)):
-        items = [str(x).strip() for x in value if str(x).strip()]
-        return items if items else None
-    return None
-
-
-def _normalize_label_mapping(raw_mapping):
-    if raw_mapping is None:
-        return None
-    out = {}
-    for k, v in raw_mapping.items():
-        out[int(k)] = int(v)
-    return out
-
-
-def _resolve_class_names(cfg: dict):
-    data_cfg = cfg.get('data', {})
-    names = data_cfg.get('class_names', None)
-    n_cls = int(data_cfg.get('num_classes', len(CLASS_NAMES)))
-    if names is None:
-        return CLASS_NAMES[:n_cls]
-    names = [str(x) for x in names]
-    if len(names) < n_cls:
-        names = names + [f'class_{i}' for i in range(len(names), n_cls)]
-    return names[:n_cls]
-
-
-def _filter_state_dict_by_shape(model: nn.Module, state_dict: dict):
-    """
-    过滤掉与当前模型 shape 不一致的权重（常见于类别数变化导致的分类头不匹配）。
-    返回：
-      filtered_state: 可安全加载的子集
-      skipped: [(key, ckpt_shape, model_shape), ...]
-    """
-    model_state = model.state_dict()
-    filtered = {}
-    skipped = []
-    for k, v in state_dict.items():
-        if k not in model_state:
-            # 不在当前模型中的 key 由 load_state_dict(strict=False) 统一处理为 unexpected
-            filtered[k] = v
-            continue
-        if hasattr(v, 'shape') and hasattr(model_state[k], 'shape'):
-            ckpt_shape = tuple(v.shape)
-            model_shape = tuple(model_state[k].shape)
-            if ckpt_shape != model_shape:
-                skipped.append((k, ckpt_shape, model_shape))
-                continue
-        filtered[k] = v
-    return filtered, skipped
-
-
-def _load_selected_frame_keys(list_path: str):
-    """
-    读取选帧清单。
-    允许每行格式：
-      seq/stem
-      seq/stem  <任意附加信息>
-    """
-    keys: List[str] = []
-    malformed = 0
-    with open(list_path, "r", encoding="utf-8") as f:
-        for ln, line in enumerate(f, 1):
-            s = line.strip()
-            if (not s) or s.startswith("#"):
-                continue
-            token = s.split()[0].replace("\\", "/")
-            if "/" not in token:
-                malformed += 1
-                continue
-            seq, stem = token.split("/", 1)
-            seq = seq.strip()
-            stem = stem.strip()
-            if (not seq) or (not stem):
-                malformed += 1
-                continue
-            keys.append(f"{seq}/{stem}")
-    # 去重并保留顺序
-    uniq = []
-    seen = set()
-    for k in keys:
-        if k not in seen:
-            seen.add(k)
-            uniq.append(k)
-    return uniq, malformed
-
-
-def _build_low_label_subset_from_file(dataset: SemanticKITTIDataset,
-                                      list_path: str,
-                                      subset_frames: int,
-                                      subset_seed: int,
-                                      strict: bool = False,
-                                      fill_random_if_insufficient: bool = True):
-    """
-    根据外部选帧清单构造低标注子集。
-    """
-    key_to_idx = {}
-    for i, frame in enumerate(dataset.frames):
-        key_to_idx[_frame_key_from_frame(frame)] = i
-
-    selected_keys, malformed = _load_selected_frame_keys(list_path)
-    found_idx: List[int] = []
-    missing_keys: List[str] = []
-    seen_idx = set()
-
-    for k in selected_keys:
-        idx = key_to_idx.get(k, None)
-        if idx is None:
-            missing_keys.append(k)
-            continue
-        if idx not in seen_idx:
-            seen_idx.add(idx)
-            found_idx.append(int(idx))
-
-    if strict and (malformed > 0 or len(missing_keys) > 0):
-        raise ValueError(
-            f"selected frame list invalid: malformed={malformed}, missing={len(missing_keys)}"
-        )
-
-    target = subset_frames if subset_frames > 0 else len(found_idx)
-    chosen = list(found_idx)
-
-    # 如果清单不足目标帧数，可选用随机补齐（避免训练帧数低于预期）
-    if len(chosen) < target and fill_random_if_insufficient:
-        rng = np.random.default_rng(subset_seed)
-        chosen_set = set(chosen)
-        remain_pool = np.asarray([i for i in range(len(dataset)) if i not in chosen_set], dtype=np.int64)
-        need = min(target - len(chosen), len(remain_pool))
-        if need > 0:
-            extra = rng.choice(remain_pool, size=need, replace=False).astype(np.int64).tolist()
-            chosen.extend([int(x) for x in extra])
-
-    # 清单多于目标时，按清单顺序截断，保证可复现
-    if target > 0 and len(chosen) > target:
-        chosen = chosen[:target]
-
-    if len(chosen) <= 0:
-        raise ValueError("selected frame list produced empty subset")
-
-    seq_counts = {}
-    for i in chosen:
-        seq = dataset.frames[int(i)]["seq"]
-        seq_counts[seq] = seq_counts.get(seq, 0) + 1
-
-    stats = {
-        "list_total": len(selected_keys),
-        "malformed": int(malformed),
-        "found": len(found_idx),
-        "missing": len(missing_keys),
-        "missing_examples": missing_keys[:5],
-        "final_used": len(chosen),
-    }
-    return Subset(dataset, chosen), chosen, seq_counts, stats
-
-
-def _collect_trainable_params(module: nn.Module) -> List[nn.Parameter]:
-    return [p for p in module.parameters() if p.requires_grad]
-
-
-def _set_stage_trainable(model: PRFNet, head_only: bool, logger: logging.Logger):
-    """
-    两阶段微调参数冻结控制：
-    - head_only=True: 仅训练分类相关头部（aggregator + rv_aux）
-    - head_only=False: 全量可训练
-    """
-    if not head_only:
-        for p in model.parameters():
-            p.requires_grad = True
-        logger.info('Two-stage: set full-model trainable.')
-        return
-
-    for p in model.parameters():
-        p.requires_grad = False
-    for m in [model.aggregator, model.rv_aux]:
-        for p in m.parameters():
-            p.requires_grad = True
-    logger.info('Two-stage: stage1 head-only trainable (aggregator + rv_aux).')
-
-
-def _build_optimizer_with_layerwise_lr(model: PRFNet, tc: dict, logger: logging.Logger):
-    """
-    构建优化器：
-    - 默认：单组参数（与历史行为一致）
-    - layerwise_lr.enable=True：按模块分组设置不同 lr 倍率
-    """
-    lwc = tc.get('layerwise_lr', {})
-    enable = bool(lwc.get('enable', False))
-    base_lr = float(tc['lr'])
-    base_wd = float(tc['weight_decay'])
-
-    if not enable:
-        opt = torch.optim.AdamW(
-            model.parameters(),
-            lr=base_lr,
-            weight_decay=base_wd,
-        )
-        logger.info('Layer-wise LR: disabled (single param group)')
-        return opt
-
-    lr_mult_backbone = float(lwc.get('lr_mult_backbone', 0.2))
-    lr_mult_mid = float(lwc.get('lr_mult_mid', 0.5))
-    lr_mult_head = float(lwc.get('lr_mult_head', 1.0))
-
-    wd_mult_backbone = float(lwc.get('wd_mult_backbone', 1.0))
-    wd_mult_mid = float(lwc.get('wd_mult_mid', 1.0))
-    wd_mult_head = float(lwc.get('wd_mult_head', 1.0))
-
-    # 按 PRFNet 结构分组
-    backbone_params = []
-    for m in [model.rv_stem, model.pb_stem, model.rv_enc, model.pb_enc]:
-        backbone_params.extend(_collect_trainable_params(m))
-
-    mid_params = []
-    for m in [model.aaffs, model.rv_dec, model.pb_dec]:
-        mid_params.extend(_collect_trainable_params(m))
-
-    head_params = []
-    for m in [model.aggregator, model.rv_aux]:
-        head_params.extend(_collect_trainable_params(m))
-
-    seen = set()
-    def _uniq(params):
-        out = []
-        for p in params:
-            pid = id(p)
-            if pid not in seen:
-                seen.add(pid)
-                out.append(p)
-        return out
-
-    backbone_params = _uniq(backbone_params)
-    mid_params = _uniq(mid_params)
-    head_params = _uniq(head_params)
-
-    # 兜底：未被显式分到上述三组的参数，归入 head 组
-    other_params = []
-    for p in model.parameters():
-        if p.requires_grad and id(p) not in seen:
-            seen.add(id(p))
-            other_params.append(p)
-    if len(other_params) > 0:
-        head_params.extend(other_params)
-
-    param_groups = []
-    if len(backbone_params) > 0:
-        param_groups.append({
-            'name': 'backbone',
-            'params': backbone_params,
-            'lr': base_lr * lr_mult_backbone,
-            'weight_decay': base_wd * wd_mult_backbone,
-        })
-    if len(mid_params) > 0:
-        param_groups.append({
-            'name': 'mid',
-            'params': mid_params,
-            'lr': base_lr * lr_mult_mid,
-            'weight_decay': base_wd * wd_mult_mid,
-        })
-    if len(head_params) > 0:
-        param_groups.append({
-            'name': 'head',
-            'params': head_params,
-            'lr': base_lr * lr_mult_head,
-            'weight_decay': base_wd * wd_mult_head,
-        })
-
-    if len(param_groups) == 0:
-        # 极端保护：回退单组
-        logger.warning('Layer-wise LR enabled but no param groups found, fallback to single group.')
-        param_groups = [{
-            'name': 'all',
-            'params': [p for p in model.parameters() if p.requires_grad],
-            'lr': base_lr,
-            'weight_decay': base_wd,
-        }]
-
-    opt = torch.optim.AdamW(param_groups)
-
-    for i, g in enumerate(opt.param_groups):
-        n_params = sum(p.numel() for p in g['params'])
-        gname = g.get('name', f'group{i}')
-        logger.info(
-            f'Layer-wise LR group[{i}] {gname}: '
-            f'params={n_params/1e6:.2f}M  lr={g["lr"]:.2e}  wd={g["weight_decay"]:.2e}'
-        )
-    return opt
-
-
-def _build_scheduler(optimizer, tc: dict, total_steps: int, logger: logging.Logger):
-    sched_type = tc.get('scheduler', 'onecycle')
-    if sched_type == 'cosine':
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=max(total_steps, 1),
-            eta_min=tc.get('eta_min', 1e-6),
-        )
-    else:
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=tc['lr'],
-            total_steps=max(total_steps, 1),
-            pct_start=tc['pct_start'],
-        )
-    logger.info(
-        f'Scheduler: {sched_type}  lr={tc["lr"]}  '
-        f'{"eta_min=" + str(tc.get("eta_min", 1e-6)) if sched_type == "cosine" else "pct_start=" + str(tc["pct_start"])}  '
-        f'total_steps={max(total_steps, 1)}'
-    )
-    return scheduler
 
 
 # ─────────────────────────────────────────────────────────────
@@ -700,7 +290,6 @@ def main(args):
     logger = setup_logger(exp_dir)
     writer = SummaryWriter(log_dir=os.path.join(exp_dir, 'tensorboard'),
                            flush_secs=lgc['tb_flush_secs'])
-    class_names = _resolve_class_names(cfg)
 
     logger.info(f'Experiment dir: {exp_dir}')
     logger.info(f'Config: {args.cfg}')
@@ -736,16 +325,8 @@ def main(args):
         f'(surface_normals={_use_normals}, angle_encoding={_use_angle})'
     )
 
-    train_seqs = _parse_csv_seqs(dc.get('train_seqs', None))
-    val_seqs = _parse_csv_seqs(dc.get('val_seqs', None))
-    require_labels = bool(dc.get('require_labels', True))
-    custom_label_mapping = _normalize_label_mapping(dc.get('label_mapping', None))
-
     train_ds = SemanticKITTIDataset(
         root=dc['root'], split='train',
-        seqs=train_seqs,
-        require_labels=require_labels,
-        label_mapping=custom_label_mapping,
         rv_H=dc['rv_H'], rv_W=dc['rv_W'],
         pb_H=dc['pb_H'], pb_W=dc['pb_W'],
         augment=dc['augment'],
@@ -764,98 +345,14 @@ def main(args):
         lasermix_p=dc.get('lasermix_p', 0.5),
         use_surface_normals=_use_normals,
         use_angle_encoding=_use_angle,
-        use_intensity=bool(dc.get('use_intensity', True)),
         copy_paste_bank=cp_bank,
         copy_paste_classes={int(k): v for k, v in cp_cfg.get('classes', {}).items()},
         cp_drop_p_base=cp_cfg.get('drop_p_base', 0.05),
         cp_min_keep=cp_cfg.get('min_keep_pts', 15),
         cp_max_tries=cp_cfg.get('max_tries', 50),
     )
-    full_train_len = len(train_ds)
-    low_label_cfg = dc.get('low_label_finetune', {})
-    ll_enable = bool(low_label_cfg.get('enable', False))
-    ll_frames = int(low_label_cfg.get('num_frames', 0))
-    ll_seed = int(low_label_cfg.get('seed', seed))
-    ll_balance_by_seq = bool(low_label_cfg.get('balance_by_seq', True))
-    ll_dump_path = low_label_cfg.get('dump_indices_path', 'selected_train_indices.txt')
-    ll_selected_path_raw = str(low_label_cfg.get('selected_frames_path', '')).strip()
-    ll_selected_strict = bool(low_label_cfg.get('selected_frames_strict', False))
-    ll_selected_fill_random = bool(low_label_cfg.get('selected_frames_fill_random', True))
-
-    ll_selected_path = ''
-    if ll_selected_path_raw:
-        if os.path.isabs(ll_selected_path_raw):
-            ll_selected_path = ll_selected_path_raw
-        else:
-            cfg_rel = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(args.cfg)), ll_selected_path_raw))
-            cwd_rel = os.path.abspath(ll_selected_path_raw)
-            if os.path.isfile(cwd_rel):
-                ll_selected_path = cwd_rel
-            elif os.path.isfile(cfg_rel):
-                ll_selected_path = cfg_rel
-            else:
-                ll_selected_path = cwd_rel
-
-    if ll_enable and ll_frames > 0:
-        if ll_selected_path:
-            if not os.path.isfile(ll_selected_path):
-                raise FileNotFoundError(
-                    f'Low-label selected_frames_path not found: {ll_selected_path}'
-                )
-            train_ds, chosen_idx, seq_counts, sel_stats = _build_low_label_subset_from_file(
-                train_ds,
-                list_path=ll_selected_path,
-                subset_frames=ll_frames,
-                subset_seed=ll_seed,
-                strict=ll_selected_strict,
-                fill_random_if_insufficient=ll_selected_fill_random,
-            )
-            logger.info(
-                'Low-label finetune enabled from selected list: '
-                f'used={len(chosen_idx)} target={ll_frames} seed={ll_seed} '
-                f'list={ll_selected_path}'
-            )
-            logger.info(
-                'Selected-list stats: '
-                f'total={sel_stats["list_total"]} found={sel_stats["found"]} '
-                f'missing={sel_stats["missing"]} malformed={sel_stats["malformed"]} '
-                f'final_used={sel_stats["final_used"]}'
-            )
-            if sel_stats["missing"] > 0:
-                logger.info(
-                    'Selected-list missing examples: ' +
-                    ', '.join(sel_stats["missing_examples"])
-                )
-        else:
-            train_ds, chosen_idx, seq_counts = _build_low_label_subset(
-                train_ds, subset_frames=ll_frames, subset_seed=ll_seed,
-                balance_by_seq=ll_balance_by_seq,
-            )
-            logger.info(
-                f'Low-label finetune enabled: sampled {len(chosen_idx)} train frames '
-                f'(seed={ll_seed}, balance_by_seq={ll_balance_by_seq})'
-            )
-        logger.info(
-            'Low-label seq distribution: ' +
-            ', '.join([f'{k}:{v}' for k, v in sorted(seq_counts.items())])
-        )
-        if ll_dump_path:
-            ll_dump_abs = os.path.join(exp_dir, ll_dump_path)
-            with open(ll_dump_abs, 'w', encoding='utf-8') as f:
-                for i in chosen_idx:
-                    frame = train_ds.dataset.frames[int(i)]
-                    velo_path = frame['velo']
-                    stem = os.path.splitext(os.path.basename(velo_path))[0]
-                    f.write(f'{frame["seq"]}/{stem}\tidx={int(i)}\n')
-            logger.info(f'Low-label frame list saved: {ll_dump_abs}')
-    else:
-        logger.info('Low-label finetune disabled: using full train split.')
-
     val_ds = SemanticKITTIDataset(
         root=dc['root'], split='val',
-        seqs=val_seqs,
-        require_labels=True,
-        label_mapping=custom_label_mapping,
         rv_H=dc['rv_H'], rv_W=dc['rv_W'],
         pb_H=dc['pb_H'], pb_W=dc['pb_W'],
         R_max=dc.get('R_max', 80.0),
@@ -864,97 +361,12 @@ def main(args):
         max_points=dc['max_points'],
         use_surface_normals=_use_normals,
         use_angle_encoding=_use_angle,
-        use_intensity=bool(dc.get('use_intensity', True)),
     )
-    full_val_len = len(val_ds)
-
-    # ── 可选：验证集子集（例如固定 100 帧）───────────────────
-    val_low_cfg = dc.get('val_low_label_finetune', {})
-    vll_enable = bool(val_low_cfg.get('enable', False))
-    vll_frames = int(val_low_cfg.get('num_frames', 0))
-    vll_seed = int(val_low_cfg.get('seed', seed + 1))
-    vll_balance_by_seq = bool(val_low_cfg.get('balance_by_seq', True))
-    vll_dump_path = val_low_cfg.get('dump_indices_path', 'selected_val_indices.txt')
-    vll_selected_path_raw = str(val_low_cfg.get('selected_frames_path', '')).strip()
-    vll_selected_strict = bool(val_low_cfg.get('selected_frames_strict', False))
-    vll_selected_fill_random = bool(val_low_cfg.get('selected_frames_fill_random', True))
-
-    vll_selected_path = ''
-    if vll_selected_path_raw:
-        if os.path.isabs(vll_selected_path_raw):
-            vll_selected_path = vll_selected_path_raw
-        else:
-            cfg_rel = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(args.cfg)), vll_selected_path_raw))
-            cwd_rel = os.path.abspath(vll_selected_path_raw)
-            if os.path.isfile(cwd_rel):
-                vll_selected_path = cwd_rel
-            elif os.path.isfile(cfg_rel):
-                vll_selected_path = cfg_rel
-            else:
-                vll_selected_path = cwd_rel
-
-    if vll_enable and vll_frames > 0:
-        if vll_selected_path:
-            if not os.path.isfile(vll_selected_path):
-                raise FileNotFoundError(
-                    f'Val selected_frames_path not found: {vll_selected_path}'
-                )
-            val_ds, vchosen_idx, vseq_counts, vsel_stats = _build_low_label_subset_from_file(
-                val_ds,
-                list_path=vll_selected_path,
-                subset_frames=vll_frames,
-                subset_seed=vll_seed,
-                strict=vll_selected_strict,
-                fill_random_if_insufficient=vll_selected_fill_random,
-            )
-            logger.info(
-                'Val-subset enabled from selected list: '
-                f'used={len(vchosen_idx)} target={vll_frames} seed={vll_seed} '
-                f'list={vll_selected_path}'
-            )
-            logger.info(
-                'Val selected-list stats: '
-                f'total={vsel_stats["list_total"]} found={vsel_stats["found"]} '
-                f'missing={vsel_stats["missing"]} malformed={vsel_stats["malformed"]} '
-                f'final_used={vsel_stats["final_used"]}'
-            )
-            if vsel_stats["missing"] > 0:
-                logger.info(
-                    'Val selected-list missing examples: ' +
-                    ', '.join(vsel_stats["missing_examples"])
-                )
-        else:
-            val_ds, vchosen_idx, vseq_counts = _build_low_label_subset(
-                val_ds,
-                subset_frames=vll_frames,
-                subset_seed=vll_seed,
-                balance_by_seq=vll_balance_by_seq,
-            )
-            logger.info(
-                f'Val-subset enabled: sampled {len(vchosen_idx)} val frames '
-                f'(seed={vll_seed}, balance_by_seq={vll_balance_by_seq})'
-            )
-        logger.info(
-            'Val-subset seq distribution: ' +
-            ', '.join([f'{k}:{v}' for k, v in sorted(vseq_counts.items())])
-        )
-        if vll_dump_path:
-            vll_dump_abs = os.path.join(exp_dir, vll_dump_path)
-            with open(vll_dump_abs, 'w', encoding='utf-8') as f:
-                for i in vchosen_idx:
-                    frame = val_ds.dataset.frames[int(i)]
-                    velo_path = frame['velo']
-                    stem = os.path.splitext(os.path.basename(velo_path))[0]
-                    f.write(f'{frame["seq"]}/{stem}\tidx={int(i)}\n')
-            logger.info(f'Val-subset frame list saved: {vll_dump_abs}')
-    else:
-        logger.info('Val-subset disabled: using full val split.')
 
     train_loader = DataLoader(
         train_ds, batch_size=dc['batch_size'],
         shuffle=True, num_workers=dc['num_workers'],
         collate_fn=collate_fn, pin_memory=True, drop_last=True,
-        persistent_workers=True, prefetch_factor=4,
     )
     val_loader = DataLoader(
         val_ds, batch_size=dc.get('val_batch_size', 4), shuffle=False,
@@ -964,12 +376,6 @@ def main(args):
     )
 
     logger.info(f'Train: {len(train_ds)} frames  |  Val: {len(val_ds)} frames')
-    writer.add_scalar('data/train_frames', float(len(train_ds)), 0)
-    writer.add_scalar('data/train_frames_ratio_to_full',
-                      float(len(train_ds)) / max(float(full_train_len), 1.0), 0)
-    writer.add_scalar('data/val_frames', float(len(val_ds)), 0)
-    writer.add_scalar('data/val_frames_ratio_to_full',
-                      float(len(val_ds)) / max(float(full_val_len), 1.0), 0)
 
     # ── 模型 ───────────────────────────────────────────────
     model = PRFNet(
@@ -1017,49 +423,29 @@ def main(args):
         focal_gamma=lc.get('focal_gamma', 2.0),
     )
 
-    # ── 两阶段微调配置（可选，默认关闭）──────────────────────
-    two_stage_cfg = tc.get('two_stage', {})
-    two_stage_enable = bool(two_stage_cfg.get('enable', False))
-    stage1_epochs = int(two_stage_cfg.get('stage1_epochs', 0))
-    if stage1_epochs < 0:
-        stage1_epochs = 0
-    if stage1_epochs >= int(tc['epochs']):
-        stage1_epochs = max(int(tc['epochs']) - 1, 0)
-    two_stage_active = two_stage_enable and stage1_epochs > 0
-
-    stage1_tc = dict(tc)
-    if two_stage_active:
-        if 'stage1_lr' in two_stage_cfg:
-            stage1_tc['lr'] = float(two_stage_cfg['stage1_lr'])
-        if 'stage1_weight_decay' in two_stage_cfg:
-            stage1_tc['weight_decay'] = float(two_stage_cfg['stage1_weight_decay'])
-        if 'stage1_scheduler' in two_stage_cfg:
-            stage1_tc['scheduler'] = str(two_stage_cfg['stage1_scheduler'])
-        if 'stage1_eta_min' in two_stage_cfg:
-            stage1_tc['eta_min'] = float(two_stage_cfg['stage1_eta_min'])
-        if 'stage1_pct_start' in two_stage_cfg:
-            stage1_tc['pct_start'] = float(two_stage_cfg['stage1_pct_start'])
-        if not bool(two_stage_cfg.get('stage1_layerwise', False)):
-            stage1_tc['layerwise_lr'] = {'enable': False}
-
-        _set_stage_trainable(model, head_only=True, logger=logger)
-        logger.info(
-            f'Two-stage finetune enabled: stage1(head-only)={stage1_epochs} epochs, '
-            f'stage2(full-layerwise)={int(tc["epochs"]) - stage1_epochs} epochs'
+    # ── 优化器 ─────────────────────────────────────────────
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=tc['lr'], weight_decay=tc['weight_decay'],
+    )
+    total_steps = len(train_loader) * tc['epochs']
+    sched_type  = tc.get('scheduler', 'onecycle')
+    if sched_type == 'cosine':
+        # 热启动首选：从 lr 单调下降到 eta_min，无峰值冲击
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=total_steps,
+            eta_min=tc.get('eta_min', 1e-6),
         )
     else:
-        _set_stage_trainable(model, head_only=False, logger=logger)
-
-    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info(f'Trainable parameters: {n_trainable/1e6:.2f}M')
-
-    # ── 优化器 ─────────────────────────────────────────────
-    phase_tc = stage1_tc if two_stage_active else tc
-    phase_name = 'stage1_head_only' if two_stage_active else 'single_stage_full'
-    optimizer = _build_optimizer_with_layerwise_lr(model, phase_tc, logger)
-    total_steps = len(train_loader) * (stage1_epochs if two_stage_active else int(tc['epochs']))
-    scheduler = _build_scheduler(optimizer, phase_tc, total_steps, logger)
-    logger.info(f'Optimization phase: {phase_name}')
+        # 从零训练默认：OneCycleLR
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer, max_lr=tc['lr'],
+            total_steps=total_steps,
+            pct_start=tc['pct_start'],
+        )
+    logger.info(f'Scheduler: {sched_type}  lr={tc["lr"]}  '
+                f'{"eta_min=" + str(tc.get("eta_min", 1e-6)) if sched_type == "cosine" else "pct_start=" + str(tc["pct_start"])}')
     scaler = torch.amp.GradScaler('cuda', enabled=tc['amp'])
 
     # ── Checkpoint 热启动（仅加载模型权重，optimizer/scheduler 从头开始）──
@@ -1068,25 +454,10 @@ def main(args):
         # --resume-ema：加载 EMA 权重（评估时使用的权重，通常比 model 权重更好）
         # 默认加载 model 权重
         if args.resume_ema and 'ema_state_dict' in ckpt:
-            raw_state = ckpt['ema_state_dict']
+            state = ckpt['ema_state_dict']
             logger.info('Resume: 使用 ema_state_dict（EMA 权重，对应验证 mIoU 的实际状态）')
         else:
-            raw_state = ckpt.get('state_dict', ckpt)
-
-        state = raw_state
-        if args.strict_false:
-            state, skipped_mismatch = _filter_state_dict_by_shape(model, raw_state)
-            if skipped_mismatch:
-                show_n = 8
-                head = '; '.join(
-                    [f'{k}: ckpt{cs}!=model{ms}' for k, cs, ms in skipped_mismatch[:show_n]]
-                )
-                logger.info(
-                    f'Resume: skip {len(skipped_mismatch)} shape-mismatched keys '
-                    f'(likely classifier/head due to class-count change): {head}'
-                    f'{"; ..." if len(skipped_mismatch) > show_n else ""}'
-                )
-
+            state = ckpt.get('state_dict', ckpt)
         missing, unexpected = model.load_state_dict(
             state, strict=not args.strict_false
         )
@@ -1109,31 +480,10 @@ def main(args):
     global_step = 0
 
     for epoch in range(1, tc['epochs'] + 1):
-        # 两阶段切换：进入 stage2 时解冻全量并重建优化器/调度器
-        if two_stage_active and epoch == (stage1_epochs + 1):
-            _set_stage_trainable(model, head_only=False, logger=logger)
-            n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            logger.info(f'Two-stage switch -> stage2 full finetune. Trainable={n_trainable/1e6:.2f}M')
-
-            optimizer = _build_optimizer_with_layerwise_lr(model, tc, logger)
-            stage2_epochs = int(tc['epochs']) - stage1_epochs
-            stage2_steps = len(train_loader) * max(stage2_epochs, 1)
-            scheduler = _build_scheduler(optimizer, tc, stage2_steps, logger)
-            logger.info('Optimization phase: stage2_full_layerwise')
-
         model.train()
         epoch_loss = 0.
         epoch_ce = epoch_lov = epoch_aux = 0.
         t0 = time.time()
-        epoch_step_time = 0.0
-        epoch_data_time = 0.0
-        epoch_grad_norm = 0.0
-        epoch_points_valid = 0.0
-        epoch_points_total = 0.0
-        epoch_rv_occ = 0.0
-        epoch_pb_occ = 0.0
-        epoch_cls_hist = np.zeros(dc['num_classes'], dtype=np.float64)
-        _iter_t_prev = time.time()
 
         # 原型漂移诊断：保存本 epoch 开始时的原型快照
         if model.aggregator.use_proto:
@@ -1141,8 +491,6 @@ def main(args):
 
         for step, batch in enumerate(train_loader, 1):
             global_step += 1
-            _iter_t_now = time.time()
-            data_dt = _iter_t_now - _iter_t_prev
 
             rv_img    = batch['rv_img'].to(device, non_blocking=True)
             pb_img    = batch['pb_img'].to(device, non_blocking=True)
@@ -1151,8 +499,6 @@ def main(args):
             points    = batch['points'].to(device, non_blocking=True)
             labels    = batch['labels'].to(device, non_blocking=True)
             rv_labels = batch['rv_labels'].to(device, non_blocking=True)  # (B,H,W)
-            labels_cpu = batch['labels']  # cpu 统计用
-            _step_t0 = time.time()
 
             optimizer.zero_grad()
 
@@ -1163,7 +509,7 @@ def main(args):
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            grad_norm = nn.utils.clip_grad_norm_(model.parameters(), tc['grad_clip'])
+            nn.utils.clip_grad_norm_(model.parameters(), tc['grad_clip'])
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
@@ -1174,20 +520,6 @@ def main(args):
             epoch_ce   += loss_dict['ce'].item()
             epoch_lov  += loss_dict['lovász'].item()
             epoch_aux  += loss_dict['aux'].item()
-            epoch_data_time += data_dt
-            epoch_step_time += (time.time() - _step_t0)
-            epoch_grad_norm += float(grad_norm.detach().cpu().item()
-                                     if torch.is_tensor(grad_norm) else grad_norm)
-
-            # 数据质量/分布统计
-            valid_mask = labels_cpu != dc['ignore_index']
-            epoch_points_valid += float(valid_mask.sum().item())
-            epoch_points_total += float(labels_cpu.numel())
-            epoch_rv_occ += float((batch['rv_img'][:, 3:4] > 0).float().mean().item())
-            epoch_pb_occ += float(batch['pb_img'][:, 8:9].float().mean().item())
-            epoch_cls_hist += _batch_class_hist(
-                labels_cpu, dc['num_classes'], dc['ignore_index']
-            )
 
             # 步级日志：终端始终打印，log_steps=false 时不写入文件
             if step % lgc['log_interval'] == 0:
@@ -1199,8 +531,7 @@ def main(args):
                     f'loss={avg:.4f}  ce={loss_dict["ce"]:.4f}  '
                     f'lov={loss_dict["lovász"]:.4f}  '
                     f'aux={loss_dict["aux"]:.4f}  '
-                    f'lr={lr:.2e}  '
-                    f'gnorm={float(grad_norm):.2f}'
+                    f'lr={lr:.2e}'
                 )
                 print(step_msg, flush=True)          # 终端始终可见
                 if lgc.get('log_steps', True):
@@ -1210,20 +541,6 @@ def main(args):
                 writer.add_scalar('train/lovász_step', loss_dict['lovász'],  global_step)
                 writer.add_scalar('train/aux_step',    loss_dict['aux'],     global_step)
                 writer.add_scalar('train/lr',          lr,                   global_step)
-                writer.add_scalar('diag/grad_norm_step', float(grad_norm), global_step)
-                writer.add_scalar('diag/rv_occ_step', float((batch['rv_img'][:, 3:4] > 0).float().mean().item()), global_step)
-                writer.add_scalar('diag/pb_occ_step', float(batch['pb_img'][:, 8:9].float().mean().item()), global_step)
-                writer.add_scalar('diag/points_valid_ratio_step',
-                                  float(valid_mask.sum().item()) / max(float(labels_cpu.numel()), 1.0),
-                                  global_step)
-                if device.type == 'cuda':
-                    writer.add_scalar('diag/gpu_mem_alloc_mb_step',
-                                      torch.cuda.memory_allocated(device) / 1024.0 / 1024.0,
-                                      global_step)
-                    writer.add_scalar('diag/gpu_mem_reserved_mb_step',
-                                      torch.cuda.memory_reserved(device) / 1024.0 / 1024.0,
-                                      global_step)
-            _iter_t_prev = time.time()
 
         # Epoch 级日志
         n = len(train_loader)
@@ -1240,28 +557,6 @@ def main(args):
         writer.add_scalar('train/ce_epoch',     epoch_ce   / n, epoch)
         writer.add_scalar('train/lovász_epoch', epoch_lov  / n, epoch)
         writer.add_scalar('train/aux_epoch',    epoch_aux  / n, epoch)
-        writer.add_scalar('diag/step_time_s_epoch', epoch_step_time / n, epoch)
-        writer.add_scalar('diag/data_time_s_epoch', epoch_data_time / n, epoch)
-        writer.add_scalar('diag/grad_norm_epoch', epoch_grad_norm / n, epoch)
-        writer.add_scalar('diag/rv_occ_epoch', epoch_rv_occ / n, epoch)
-        writer.add_scalar('diag/pb_occ_epoch', epoch_pb_occ / n, epoch)
-        writer.add_scalar(
-            'diag/points_valid_ratio_epoch',
-            epoch_points_valid / max(epoch_points_total, 1.0), epoch
-        )
-        cls_hist_sum = epoch_cls_hist.sum()
-        if cls_hist_sum > 0:
-            cls_freq = epoch_cls_hist / cls_hist_sum
-            for i, name in enumerate(class_names):
-                writer.add_scalar(f'data/class_freq_{name}', float(cls_freq[i]), epoch)
-        if device.type == 'cuda':
-            writer.add_scalar('diag/gpu_mem_alloc_mb_epoch',
-                              torch.cuda.max_memory_allocated(device) / 1024.0 / 1024.0,
-                              epoch)
-            writer.add_scalar('diag/gpu_mem_reserved_mb_epoch',
-                              torch.cuda.max_memory_reserved(device) / 1024.0 / 1024.0,
-                              epoch)
-            torch.cuda.reset_peak_memory_stats(device)
 
         # ── 诊断指标（VCG gate entropy + SPM proto drift）──────
         diag = model.aggregator.get_and_reset_diagnostics()
@@ -1294,7 +589,7 @@ def main(args):
 
         # ── 验证 ──────────────────────────────────────────
         if epoch % tc['val_every'] == 0:
-            miou, per_cls, per_prec, per_rec, dist_iou = evaluate(
+            miou, per_cls = evaluate(
                 ema_model, val_loader, device,
                 dc['num_classes'], dc['ignore_index'],
                 use_knn=ec.get('use_knn', False),
@@ -1308,39 +603,14 @@ def main(args):
             # 逐类 IoU
             cls_line = '  '.join(
                 f'{name[:6]}:{iou:.1f}' if not np.isnan(iou) else f'{name[:6]}:--'
-                for name, iou in zip(class_names, per_cls)
+                for name, iou in zip(CLASS_NAMES, per_cls)
             )
             logger.info(f'   Per-class: {cls_line}')
-            prec_line = '  '.join(
-                f'{name[:6]}:{p:.1f}' if not np.isnan(p) else f'{name[:6]}:--'
-                for name, p in zip(class_names, per_prec)
-            )
-            rec_line = '  '.join(
-                f'{name[:6]}:{r:.1f}' if not np.isnan(r) else f'{name[:6]}:--'
-                for name, r in zip(class_names, per_rec)
-            )
-            logger.info(f'   Precision: {prec_line}')
-            logger.info(f'   Recall:    {rec_line}')
-            logger.info(
-                '   Dist-IoU: '
-                f"near={dist_iou.get('near', float('nan')):.2f}%  "
-                f"mid={dist_iou.get('mid', float('nan')):.2f}%  "
-                f"far={dist_iou.get('far', float('nan')):.2f}%"
-            )
 
             writer.add_scalar('val/mIoU', miou, epoch)
-            for name, iou in zip(class_names, per_cls):
+            for name, iou in zip(CLASS_NAMES, per_cls):
                 if not np.isnan(iou):
                     writer.add_scalar(f'val/iou_{name}', iou, epoch)
-            for name, p in zip(class_names, per_prec):
-                if not np.isnan(p):
-                    writer.add_scalar(f'val/precision_{name}', p, epoch)
-            for name, r in zip(class_names, per_rec):
-                if not np.isnan(r):
-                    writer.add_scalar(f'val/recall_{name}', r, epoch)
-            for k, v in dist_iou.items():
-                if np.isfinite(v):
-                    writer.add_scalar(f'val/dist_iou_{k}', v, epoch)
 
             # 保存 checkpoint
             ckpt = {
@@ -1408,12 +678,6 @@ def evaluate(model, loader, device, num_classes, ignore_index,
     """
     model.eval()
     metric = IoUMetric(num_classes, ignore_index)
-    cm = np.zeros((num_classes, num_classes), dtype=np.int64)
-    # 距离分段统计：near/mid/far
-    bins = [(0.0, 20.0), (20.0, 40.0), (40.0, np.inf)]
-    bin_names = ['near', 'mid', 'far']
-    bin_inter = {k: np.zeros(num_classes, dtype=np.float64) for k in bin_names}
-    bin_union = {k: np.zeros(num_classes, dtype=np.float64) for k in bin_names}
 
     def _refine_batch(preds_np, labels_np, rv_coords_np, pb_coords_np):
         """在线程池内并行精化一个 batch 内的所有样本，返回精化后的 preds (B, N) ndarray"""
@@ -1466,15 +730,6 @@ def evaluate(model, loader, device, num_classes, ignore_index,
             preds_refined = torch.from_numpy(
                 np.stack(refined_list, axis=0))          # (B, N)
             metric.update(preds_refined, pending_labels)
-            # 混淆矩阵
-            p = preds_refined.numpy().reshape(-1).astype(np.int64)
-            g = pending_labels.numpy().reshape(-1).astype(np.int64)
-            valid = g != ignore_index
-            if valid.any():
-                idx = g[valid] * num_classes + p[valid]
-                cm += np.bincount(
-                    idx, minlength=num_classes * num_classes
-                ).reshape(num_classes, num_classes)
 
         # ── 3. GPU forward ─────────────────────────────────────
         outputs = model(rv_img, pb_img, rv_coords, pb_coords, points)
@@ -1494,14 +749,6 @@ def evaluate(model, loader, device, num_classes, ignore_index,
             pending_labels = labels
         else:
             metric.update(preds, labels)
-            p = preds.numpy().reshape(-1).astype(np.int64)
-            g = labels.numpy().reshape(-1).astype(np.int64)
-            valid = g != ignore_index
-            if valid.any():
-                idx = g[valid] * num_classes + p[valid]
-                cm += np.bincount(
-                    idx, minlength=num_classes * num_classes
-                ).reshape(num_classes, num_classes)
             pending_future = None
             pending_labels = None
 
@@ -1510,57 +757,12 @@ def evaluate(model, loader, device, num_classes, ignore_index,
         refined_list = pending_future.result()
         preds_refined = torch.from_numpy(np.stack(refined_list, axis=0))
         metric.update(preds_refined, pending_labels)
-        p = preds_refined.numpy().reshape(-1).astype(np.int64)
-        g = pending_labels.numpy().reshape(-1).astype(np.int64)
-        valid = g != ignore_index
-        if valid.any():
-            idx = g[valid] * num_classes + p[valid]
-            cm += np.bincount(
-                idx, minlength=num_classes * num_classes
-            ).reshape(num_classes, num_classes)
 
     if knn_executor is not None:
         knn_executor.shutdown(wait=False)
 
-    # 距离分段 IoU（需要原始 points）
-    for batch in loader:
-        rv_img    = batch['rv_img'].to(device)
-        pb_img    = batch['pb_img'].to(device)
-        rv_coords = batch['rv_coords'].to(device)
-        pb_coords = batch['pb_coords'].to(device)
-        points    = batch['points'].to(device)
-        labels    = batch['labels']  # cpu
-
-        outputs = model(rv_img, pb_img, rv_coords, pb_coords, points)
-        preds = outputs['logits'].argmax(dim=-1).cpu().numpy().astype(np.int64)
-        gts   = labels.numpy().astype(np.int64)
-        dist  = torch.norm(points[..., :3], dim=-1).cpu().numpy()
-        for b in range(preds.shape[0]):
-            for (lo, hi), name in zip(bins, bin_names):
-                m = (dist[b] >= lo) & (dist[b] < hi) & (gts[b] != ignore_index)
-                if not np.any(m):
-                    continue
-                p = preds[b][m]
-                g = gts[b][m]
-                idx = g * num_classes + p
-                cm_bin = np.bincount(
-                    idx, minlength=num_classes * num_classes
-                ).reshape(num_classes, num_classes)
-                inter = np.diag(cm_bin).astype(np.float64)
-                union = cm_bin.sum(1) + cm_bin.sum(0) - np.diag(cm_bin)
-                bin_inter[name] += inter
-                bin_union[name] += union
-
-    precision = np.where(cm.sum(axis=0) > 0, np.diag(cm) / (cm.sum(axis=0) + 1e-10), np.nan) * 100.0
-    recall    = np.where(cm.sum(axis=1) > 0, np.diag(cm) / (cm.sum(axis=1) + 1e-10), np.nan) * 100.0
-    dist_iou = {}
-    for name in bin_names:
-        valid = bin_union[name] > 0
-        iou = np.where(valid, bin_inter[name] / (bin_union[name] + 1e-10), np.nan) * 100.0
-        dist_iou[name] = float(np.nanmean(iou)) if np.any(valid) else float('nan')
-
     model.train()
-    return metric.miou(), metric.per_class_iou(), precision, recall, dist_iou
+    return metric.miou(), metric.per_class_iou()
 
 
 # ─────────────────────────────────────────────────────────────
