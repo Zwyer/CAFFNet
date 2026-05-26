@@ -8,7 +8,7 @@ import yaml
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 from ..utils.projection import RangeImageProjector, PolarBEVProjector
 from .instance_bank import InstanceBank
@@ -230,6 +230,8 @@ class SemanticKITTIDataset(Dataset):
     def __init__(self,
                  root: str,
                  split: str = 'train',
+                 seqs: Optional[Union[str, Sequence[str]]] = None,
+                 require_labels: bool = True,
                  rv_H: int = 64,  rv_W: int = 512,
                  pb_H: int = 240, pb_W: int = 512,
                  augment: bool = True,
@@ -250,6 +252,10 @@ class SemanticKITTIDataset(Dataset):
                  # ── 【创新①②】RV 特征增强开关 ────────────────
                  use_surface_normals: bool = False,
                  use_angle_encoding: bool = False,
+                 # 是否使用 intensity（False 时将 intensity 置零，但保持通道维度不变）
+                 use_intensity: bool = True,
+                 # 自定义标签映射（raw_label -> train_id）；None 时使用默认 SemanticKITTI 映射
+                 label_mapping: Optional[Dict[int, int]] = None,
                  # ── Copy-Paste 实例增强 ────────────────────
                  copy_paste_bank: Optional[InstanceBank] = None,
                  copy_paste_classes: Optional[dict] = None,
@@ -262,19 +268,34 @@ class SemanticKITTIDataset(Dataset):
         self.max_points = max_points
         self.R_max = R_max
         self.rv_H = rv_H
+        self.use_intensity = bool(use_intensity)
+        self.require_labels = require_labels and (split != 'test')
+        self.label_mapping = (
+            {int(k): int(v) for k, v in label_mapping.items()}
+            if label_mapping is not None else LABEL_MAPPING
+        )
 
-        if split == 'train':
-            seqs = TRAIN_SEQS
-        elif split == 'val':
-            seqs = VAL_SEQS
+        if seqs is None:
+            if split == 'train':
+                seq_list = list(TRAIN_SEQS)
+            elif split == 'val':
+                seq_list = list(VAL_SEQS)
+            else:
+                seq_list = list(TEST_SEQS)
         else:
-            seqs = TEST_SEQS
+            if isinstance(seqs, str):
+                seq_list = [s.strip() for s in seqs.split(',') if s.strip()]
+            else:
+                seq_list = [str(s).strip() for s in seqs if str(s).strip()]
+        self.seqs = seq_list
 
         # 构建帧文件列表
         self.frames: List[Dict[str, str]] = []
-        for seq in seqs:
+        for seq in self.seqs:
             velo_dir  = os.path.join(root, 'sequences', seq, 'velodyne')
             label_dir = os.path.join(root, 'sequences', seq, 'labels')
+            if not os.path.isdir(velo_dir):
+                continue
             bins = sorted(os.listdir(velo_dir))
             for b in bins:
                 stem = b.replace('.bin', '')
@@ -283,7 +304,11 @@ class SemanticKITTIDataset(Dataset):
                     'seq':  seq,
                 }
                 if split != 'test':
-                    entry['label'] = os.path.join(label_dir, stem + '.label')
+                    label_path = os.path.join(label_dir, stem + '.label')
+                    if os.path.isfile(label_path):
+                        entry['label'] = label_path
+                    elif self.require_labels:
+                        continue
                 self.frames.append(entry)
 
         # 建立 label 映射表（uint16 → train_id）
@@ -448,7 +473,7 @@ class SemanticKITTIDataset(Dataset):
 
     def _build_label_lut(self):
         lut = np.full(65536, 255, dtype=np.int32)
-        for raw, train in LABEL_MAPPING.items():
+        for raw, train in self.label_mapping.items():
             if raw < 65536:
                 lut[raw] = train
         self.label_lut = lut
@@ -464,7 +489,7 @@ class SemanticKITTIDataset(Dataset):
         dist = np.linalg.norm(pts[:, :3], axis=1)
         pts = pts[dist > 0.5]
 
-        if 'label' in entry:
+        if 'label' in entry and os.path.isfile(entry['label']):
             raw_labels = np.fromfile(entry['label'], dtype=np.uint32)
             raw_labels = raw_labels.reshape(-1) & 0xFFFF   # 取低16位语义标签
             raw_labels = raw_labels[dist > 0.5]
@@ -509,11 +534,14 @@ class SemanticKITTIDataset(Dataset):
             pts    = pts[idx_s]
             labels = labels[idx_s]
 
-        intensity = pts[:, 3].copy()
+        pts_out = pts.astype(np.float32, copy=True)
+        if not self.use_intensity:
+            pts_out[:, 3] = 0.0
+        intensity = pts_out[:, 3].copy()
 
         # 生成 Range Image（rv_point_idx 记录每像素对应的点索引，用于像素级 aux 标签）
-        rv_img, rv_point_idx = self.rv_proj.project(pts[:, :3], intensity)
-        rv_coords = self.rv_proj.compute_sample_coords(pts[:, :3])
+        rv_img, rv_point_idx = self.rv_proj.project(pts_out[:, :3], intensity)
+        rv_coords = self.rv_proj.compute_sample_coords(pts_out[:, :3])
 
         # 像素级 Range Image 标签（用于 rv_aux 辅助损失）
         # rv_point_idx[h,w] >= 0 时取该点的语义标签，否则填 255（ignore）
@@ -522,13 +550,13 @@ class SemanticKITTIDataset(Dataset):
         rv_labels_np[valid_pix] = labels[rv_point_idx[valid_pix]]
 
         # 生成 Polar BEV
-        pb_img = self.pb_proj.project(pts[:, :3], intensity)
-        pb_coords = self.pb_proj.compute_sample_coords(pts[:, :3])
+        pb_img = self.pb_proj.project(pts_out[:, :3], intensity)
+        pb_coords = self.pb_proj.compute_sample_coords(pts_out[:, :3])
 
         # 转 Tensor
         rv_img_t    = torch.from_numpy(rv_img)                        # (rv_channels, H, W)
         pb_img_t    = torch.from_numpy(pb_img)                        # (9, H_p, W_p)
-        pts_t       = torch.from_numpy(pts.astype(np.float32))        # (N, 4)
+        pts_t       = torch.from_numpy(pts_out.astype(np.float32, copy=False))  # (N, 4)
         labels_t    = torch.from_numpy(labels.astype(np.int64))       # (N,)
         rv_labels_t = torch.from_numpy(rv_labels_np)                  # (H, W)
 

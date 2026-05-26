@@ -1,0 +1,170 @@
+# CAFNet 16lidar 10类微调配置（00训练, 01验证）
+# 热启动权重：
+# /root/autodl-tmp/CAFFNet_nomae_pcpmae/runs/prfnet_16lidar_pretrain_rankme/20260508_164703/checkpoints/latest.pt
+
+data:
+  dataset_name: 16lidar
+  root: /root/autodl-tmp/16lidar_labeled_v.tengfei
+  train_seqs: "00"
+  val_seqs: "01"
+  require_labels: true
+
+  # 10类（labels.xml 中除 unlabeled 外）
+  num_classes: 10
+  ignore_index: 255
+  class_names:
+    - car
+    - road
+    - building
+    - fence
+    - curb
+    - vegetation
+    - trunk
+    - terrain
+    - pole
+    - other-object
+
+  # raw label id -> train id
+  label_mapping:
+    0: 255
+    10: 0
+    40: 1
+    50: 2
+    51: 3
+    53: 4
+    70: 5
+    71: 6
+    72: 7
+    80: 8
+    99: 9
+
+  rv_H: 16
+  rv_W: 1024
+  pb_H: 128
+  pb_W: 1024
+  max_points: 32768
+  fov_up: 14.0
+  fov_down: -16.0
+  R_max: 85.0
+
+  batch_size: 16
+  num_workers: 12
+  val_batch_size: 16
+  val_num_workers: 12
+
+  augment: true
+  use_polarmix: false
+  rotate: true
+  flip: true
+  scale_min: 0.95
+  scale_max: 1.05
+  drop_p: 0.02
+  polarmix_p: 0.0
+  polarmix_sectors: 8
+  use_lasermix: false
+  lasermix_p: 0.0
+
+  use_surface_normals: false
+  use_angle_encoding: true
+  use_intensity: false # 使用/不使用intensity
+
+  low_label_finetune:
+    enable: true
+    num_frames: 200
+    seed: 42
+    balance_by_seq: true
+    selected_frames_path: ""
+    selected_frames_strict: true
+    selected_frames_fill_random: false
+    dump_indices_path: selected_train_indices.txt
+
+  # 可选：验证集抽样（不提供 selected_frames_path 时按 seed 随机抽）
+  val_low_label_finetune:
+    enable: true
+    num_frames: 100
+    seed: 43
+    balance_by_seq: true
+    selected_frames_path: ""
+    selected_frames_strict: false
+    selected_frames_fill_random: true
+    dump_indices_path: selected_val_indices.txt
+
+  copy_paste:
+    enable: false
+    bank_path: "instance_bank_semantickitti.npz"
+    classes: {}
+    drop_p_base: 0.05
+    min_keep_pts: 15
+    max_tries: 50
+
+model:
+  pb_in: 9
+  enc_channels: [64, 128, 256, 256]
+  dec_out_c: 64
+  head_dropout: 0.10
+  expand_ratios: [2, 2, 4, 4]
+  rv_strides: [[1,2],[2,2],[2,2],[2,2]]
+  pb_strides: [[2,2],[2,2],[2,2],[2,2]]
+  aspp_rates: [1, 3, 6, 9]
+  use_ds_aaff: true
+  ds_aaff_K: 2
+  use_surface_normals: false
+  use_angle_encoding: true
+  use_vcg: false
+  use_proto: false
+  proto_dim: 64
+  rv_in: 9
+
+train:
+  epochs: 300
+  seed: 42
+  optimizer: adamw
+  lr: 2.0e-4
+  weight_decay: 1.0e-4
+  layerwise_lr:
+    enable: true
+    lr_mult_backbone: 0.20
+    lr_mult_mid: 0.50
+    lr_mult_head: 1.00
+    wd_mult_backbone: 1.00
+    wd_mult_mid: 1.00
+    wd_mult_head: 1.00
+  grad_clip: 10.0
+  scheduler: cosine
+  pct_start: 0.10
+  eta_min: 1.0e-6
+  amp: true
+  ema_decay: 0.999
+  val_every: 1
+  save_topk_ckpts: 5
+
+loss:
+  lambda_lovasz: 1.5
+  lambda_aux: 0.1
+  use_focal: true
+  focal_gamma: 2.0
+  label_smoothing: 0.0
+  # 提升长尾类召回（fence/curb/trunk/pole/other-object）
+  # class order: car, road, building, fence, curb, vegetation, trunk, terrain, pole, other-object
+  class_weights:
+    - 1.0
+    - 1.0
+    - 1.0
+    - 1.6
+    - 1.4
+    - 1.0
+    - 1.8
+    - 1.0
+    - 1.6
+    - 1.5
+
+eval:
+  use_knn: false
+  knn_radius: 1
+  knn_dual: false
+
+log:
+  save_dir: runs/cafnet_16lidar_10cls_finetune
+  log_interval: 50
+  log_steps: false
+  tb_flush_secs: 30
