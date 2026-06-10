@@ -1351,8 +1351,6 @@ def main(args):
                 'miou':            miou,
                 'cfg':             cfg,
             }
-            # 每个 epoch 保存 latest
-            torch.save(ckpt, os.path.join(ckpt_dir, 'latest.pth'))
 
             if miou > best_miou:
                 best_miou = miou
@@ -1375,6 +1373,17 @@ def main(args):
                     [f'ep{ep:03d}:{score:.2f}' for score, ep, _ in topk_ckpts]
                 )
                 logger.info(f'   Top-{save_topk_ckpts} ckpts: {topk_line}')
+
+        # ── 每个 epoch 保存 latest.pth（不依赖验证）────────────
+        ckpt_no_val = {
+            'epoch':           epoch,
+            'state_dict':      model.state_dict(),
+            'ema_state_dict':  ema_model.module.state_dict(),
+            'optimizer':       optimizer.state_dict(),
+            'miou':            0.0,
+            'cfg':             cfg,
+        }
+        torch.save(ckpt_no_val, os.path.join(ckpt_dir, 'latest.pth'))
 
     writer.close()
     logger.info(f'Training done.  Best val mIoU = {best_miou:.2f}%')

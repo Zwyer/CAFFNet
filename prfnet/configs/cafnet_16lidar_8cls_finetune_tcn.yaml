@@ -1,12 +1,5 @@
-# CAFNet 16lidar 8类微调配置
+# CAFNet 16lidar 8类微调配置（300帧全训练，无验证集）
 # 用法：
-#   # Step 1: 生成 train/val 分割清单
-#   python tools/split_train_val.py /root/autodl-tmp/16lidar_labeled.v.tcn/ -s 00,01,02,03,04 --val-ratio 0.3 -o runs/finetune_tcn/
-#
-#   # Step 2: 如果 label 还是 SK raw ID，先重映射
-#   python tools/remap_labels.py /root/autodl-tmp/16lidar_labeled.v.tcn/sequences/00/predictions -o /root/autodl-tmp/16lidar_labeled.v.tcn/sequences/00/labels
-#
-#   # Step 3: 启动微调
 #   python train.py \
 #       --cfg prfnet/configs/cafnet_16lidar_8cls_finetune_tcn.yaml \
 #       --resume /root/autodl-tmp/20260603_191642/checkpoints/latest.pth \
@@ -15,8 +8,8 @@
 data:
   dataset_name: 16lidar
   root: /root/autodl-tmp/16lidar_labeled.v.tcn/     # ← 你的数据集路径
-  train_seqs: "00,01,02,03,04"     # 全部序列（帧级分割由 selected_frames_path 控制）
-  val_seqs: "00,01,02,03,04"       # 同上
+  train_seqs: "00,01,02,03"     # 全部序列用于训练
+  val_seqs: "03"                   # 占位（DataLoader 需要初始化，但 val_every 不会触发）
   require_labels: true             # ← 微调必须为 true
 
   # 8 类（0=未标注→ignore, 1~8=有效类→0~7）
@@ -77,26 +70,19 @@ data:
   use_angle_encoding: true       # ← 必须与预训练一致
   use_intensity: false           # ← 必须与预训练一致
 
-  # ── 低标注微调：通过帧清单选择 train/val ──
+  # ── 300帧全量训练，无验证 ──
   low_label_finetune:
     enable: true
-    num_frames: 0                             # 0 = 使用清单中的全部帧
+    num_frames: 300                           # 全部 300 帧
     seed: 42
     balance_by_seq: true
-    selected_frames_path: runs/finetune_tcn/train_frames.txt   # ← split_train_val.py 输出
+    selected_frames_path: ""
     selected_frames_strict: true
     selected_frames_fill_random: false
     dump_indices_path: selected_train_indices.txt
 
   val_low_label_finetune:
-    enable: true
-    num_frames: 0                             # 0 = 使用清单中的全部帧
-    seed: 43
-    balance_by_seq: true
-    selected_frames_path: runs/finetune_tcn/val_frames.txt     # ← split_train_val.py 输出
-    selected_frames_strict: true
-    selected_frames_fill_random: false
-    dump_indices_path: selected_val_indices.txt
+    enable: false
 
   copy_paste:
     enable: false
@@ -142,7 +128,7 @@ train:
     wd_mult_head: 1.00
   # ── 两阶段微调：先训 head，再全量微调 ──
   two_stage:
-    enable: true
+    enable: false
     stage1_epochs: 10
     stage1_layerwise: false
     stage1_lr: 5.0e-4            # Stage1 head 训练用稍高 LR
@@ -155,8 +141,8 @@ train:
   eta_min: 1.0e-6
   amp: true
   ema_decay: 0.999
-  val_every: 1
-  save_topk_ckpts: 5
+  val_every: 99999               # 不触发验证，每个 epoch 仍保存 latest.pth
+  save_topk_ckpts: 0              # 0 = 不保留 top-k（无验证 mIoU 可用）
 
 loss:
   lambda_lovasz: 1.5
