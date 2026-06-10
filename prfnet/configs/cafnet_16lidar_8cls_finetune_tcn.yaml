@@ -1,0 +1,187 @@
+# CAFNet 16lidar 8类微调配置
+# 用法：
+#   # Step 1: 生成 train/val 分割清单
+#   python tools/split_train_val.py /root/autodl-tmp/16lidar_labeled.v.tcn/ -s 00,01,02,03,04 --val-ratio 0.3 -o runs/finetune_tcn/
+#
+#   # Step 2: 如果 label 还是 SK raw ID，先重映射
+#   python tools/remap_labels.py /root/autodl-tmp/16lidar_labeled.v.tcn/sequences/00/predictions -o /root/autodl-tmp/16lidar_labeled.v.tcn/sequences/00/labels
+#
+#   # Step 3: 启动微调
+#   python train.py \
+#       --cfg prfnet/configs/cafnet_16lidar_8cls_finetune_tcn.yaml \
+#       --resume /root/autodl-tmp/20260603_191642/checkpoints/latest.pth \
+#       --strict-false --resume-ema
+
+data:
+  dataset_name: 16lidar
+  root: /root/autodl-tmp/16lidar_labeled.v.tcn/     # ← 你的数据集路径
+  train_seqs: "00,01,02,03,04"     # 全部序列（帧级分割由 selected_frames_path 控制）
+  val_seqs: "00,01,02,03,04"       # 同上
+  require_labels: true             # ← 微调必须为 true
+
+  # 8 类（0=未标注→ignore, 1~8=有效类→0~7）
+  num_classes: 8
+  ignore_index: 255
+  class_names:
+    - 汽车              # 0
+    - 自行车            # 1
+    - 行人              # 2
+    - 道路              # 3
+    - 建筑              # 4
+    - 植被              # 5
+    - 路沿              # 6
+    - 低矮障碍物        # 7
+
+  # ── 标签映射：已重映射ID (0~8) → 训练ID (0~7, 255=ignore) ──
+  # 如果你的 label 还是 SK raw (10=c ar, 40=road...)，请先运行 tools/remap_labels.py
+  # 或者删除下面映射，换用 SK raw → train 的映射（见文件末尾注释）
+  label_mapping:
+    0: 255     # 未标注
+    1: 0       # 汽车
+    2: 1       # 自行车
+    3: 2       # 行人
+    4: 3       # 道路
+    5: 4       # 建筑
+    6: 5       # 植被
+    7: 6       # 路沿
+    8: 7       # 低矮障碍物
+
+  # ── 以下参数必须与预训练 checkpoint 完全一致 ──
+  rv_H: 16
+  rv_W: 1024
+  pb_H: 128
+  pb_W: 1024
+  max_points: 32768
+  fov_up: 14.0
+  fov_down: -16.0
+  R_max: 85.0
+
+  batch_size: 16
+  num_workers: 12
+  val_batch_size: 16
+  val_num_workers: 12
+
+  augment: true
+  use_polarmix: false
+  rotate: true
+  flip: true
+  scale_min: 0.95
+  scale_max: 1.05
+  drop_p: 0.02
+  polarmix_p: 0.0
+  polarmix_sectors: 8
+  use_lasermix: false
+  lasermix_p: 0.0
+
+  use_surface_normals: false     # ← 必须与预训练一致
+  use_angle_encoding: true       # ← 必须与预训练一致
+  use_intensity: false           # ← 必须与预训练一致
+
+  # ── 低标注微调：通过帧清单选择 train/val ──
+  low_label_finetune:
+    enable: true
+    num_frames: 0                             # 0 = 使用清单中的全部帧
+    seed: 42
+    balance_by_seq: true
+    selected_frames_path: runs/finetune_tcn/train_frames.txt   # ← split_train_val.py 输出
+    selected_frames_strict: true
+    selected_frames_fill_random: false
+    dump_indices_path: selected_train_indices.txt
+
+  val_low_label_finetune:
+    enable: true
+    num_frames: 0                             # 0 = 使用清单中的全部帧
+    seed: 43
+    balance_by_seq: true
+    selected_frames_path: runs/finetune_tcn/val_frames.txt     # ← split_train_val.py 输出
+    selected_frames_strict: true
+    selected_frames_fill_random: false
+    dump_indices_path: selected_val_indices.txt
+
+  copy_paste:
+    enable: false
+    bank_path: "instance_bank_semantickitti.npz"
+    classes: {}
+    drop_p_base: 0.05
+    min_keep_pts: 15
+    max_tries: 50
+
+# ── 模型结构：与 checkpoint 完全一致，禁止修改 ──
+model:
+  pb_in: 9
+  enc_channels: [64, 128, 256, 256]
+  dec_out_c: 64
+  head_dropout: 0.10
+  expand_ratios: [2, 2, 4, 4]
+  rv_strides: [[1,2],[2,2],[2,2],[2,2]]
+  pb_strides: [[2,2],[2,2],[2,2],[2,2]]
+  aspp_rates: [1, 3, 6, 9]
+  use_ds_aaff: true
+  ds_aaff_K: 2
+  use_surface_normals: false
+  use_angle_encoding: true
+  use_vcg: false
+  use_proto: false
+  proto_dim: 64
+  rv_in: 9        # 6 + 3(angle_encoding)，由 train.py 自动计算，此处仅作参考
+
+train:
+  epochs: 200
+  seed: 42
+  optimizer: adamw
+  lr: 2.0e-4                     # 微调用较低 LR
+  weight_decay: 1.0e-4
+  # ── 分层学习率：保护 backbone 预训练知识 ──
+  layerwise_lr:
+    enable: true
+    lr_mult_backbone: 0.20
+    lr_mult_mid: 0.50
+    lr_mult_head: 1.00
+    wd_mult_backbone: 1.00
+    wd_mult_mid: 1.00
+    wd_mult_head: 1.00
+  # ── 两阶段微调：先训 head，再全量微调 ──
+  two_stage:
+    enable: true
+    stage1_epochs: 10
+    stage1_layerwise: false
+    stage1_lr: 5.0e-4            # Stage1 head 训练用稍高 LR
+    stage1_weight_decay: 1.0e-4
+    stage1_scheduler: cosine
+    stage1_eta_min: 1.0e-6
+  grad_clip: 10.0
+  scheduler: cosine               # cosine 平滑下降，适合 fine-tune
+  pct_start: 0.10
+  eta_min: 1.0e-6
+  amp: true
+  ema_decay: 0.999
+  val_every: 1
+  save_topk_ckpts: 5
+
+loss:
+  lambda_lovasz: 1.5
+  lambda_aux: 0.1
+  use_focal: true
+  focal_gamma: 2.0
+  label_smoothing: 0.0
+  # 8类权重（汽车/道路/建筑/植被 高频，其他 中低频 适当拉高）
+  class_weights:
+    - 1.0     # 汽车 (高频)
+    - 2.0     # 自行车 (中低频)
+    - 2.5     # 行人 (低频，16线点云中点数很少)
+    - 1.0     # 道路 (高频)
+    - 1.0     # 建筑 (高频)
+    - 1.0     # 植被 (高频)
+    - 1.4     # 路沿 (中频)
+    - 1.5     # 低矮障碍物 (中低频，聚合多类)
+
+eval:
+  use_knn: false
+  knn_radius: 1
+  knn_dual: false
+
+log:
+  save_dir: runs/cafnet_16lidar_8cls_finetune_tcn
+  log_interval: 50
+  log_steps: false
+  tb_flush_secs: 30
